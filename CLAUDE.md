@@ -1,4 +1,4 @@
-# deej Fork — Project Context (SERENITY)
+# deej-x — Project Context (SERENITY)
 
 ## Standing Rules for Claude
 
@@ -13,29 +13,9 @@
 
 Fork of [omriharel/deej](https://github.com/omriharel/deej) (MIT license), a Go desktop app that reads slider values from a serial-connected microcontroller and maps them to Windows/Linux audio session volumes.
 
+**Module path:** `github.com/sclead03/deej-x`
+
 This fork is customized exclusively for the **SERENITY** hardware: a custom ATmega32U4-based audio mixer with 5 faders, 5 mute buttons/LEDs, a rotary encoder, an RGB LED button, and 6 SSD1306 OLED displays. The original deej host app works with SERENITY as-is for basic fader control; this fork adds bidirectional communication, OLED icon/name streaming, and system mic mute via HID.
-
----
-
-## Step 0 — Repo Cleanup (Do First)
-
-Before any feature work, audit the repo and remove or flag everything that doesn't belong in this fork. This is a read-and-decide pass, not a blind delete — unknown items should be flagged for discussion before removal.
-
-**Known candidates for removal:**
-- `arduino/` directory — contains the vanilla 5-slider Arduino sketch (`deej-5-sliders-vanilla.ino`). SERENITY uses a completely different MCU (ATmega32U4), a different toolchain (PlatformIO), and a separate firmware repo. This sketch has no place here.
-- `assets/schematic.png` and `assets/build-*.png/jpg` — reference the original shoebox/breadboard build, not SERENITY hardware.
-- `community.md` and `assets/community-builds/` — upstream community showcase content; irrelevant to a personal fork.
-- `docs/faq/` — upstream FAQ written for vanilla deej hardware and workflow.
-- `.github/FUNDING.yml` — upstream funding config; not applicable.
-- CI workflow (`.github/workflows/main.yml`) — may need updating or removal depending on whether CI is wanted for this fork.
-- Any "this might be broken" or upstream-TODO comments in Go source files.
-
-**Approach:**
-1. Walk the full directory tree and categorize each file/directory: **keep**, **remove**, or **unknown/discuss**.
-2. Check Go source files for upstream-specific comments, TODOs, or references that don't apply.
-3. Review `config.yaml` — update defaults (baud rate, example slider mapping) to reflect SERENITY.
-4. Review `README.md` — upstream README; decide whether to gut it, replace it, or leave a stub.
-5. Do not remove anything without confirming with the user if there is any doubt.
 
 ---
 
@@ -56,29 +36,26 @@ Before any feature work, audit the repo and remove or flag everything that doesn
 masterVol|fader0|fader1|fader2|fader3|fader4\r\n
 ```
 
-Six pipe-delimited values, 0–1023 each. Index 0 is the master volume encoder; indices 1–5 are the analog faders. The existing `expectedLinePattern` regex in `serial.go` already handles variable channel counts and requires no changes. The firmware only transmits on value changes — the host must not assume a regular update rate.
+Six pipe-delimited values, 0–1023 each. Index 0 is the master volume encoder; indices 1–5 are the analog faders. The existing `expectedLinePattern` regex in `serial.go` handles variable channel counts and requires no changes. The firmware only transmits on value changes — the host must not assume a regular update rate.
 
 Index 0 maps in `config.yaml` like any other channel (`slider_mapping: 0: master`). The host has no special awareness that it is encoder-sourced vs. ADC-sourced.
 
-### Config changes
+### Config keys
 
-`config.yaml` default baud rate changes from 9600 to 115200. New fields:
-
-```yaml
-# Path to the icon library directory (icons named by channel index)
-icon_path: ./icons
-
-# Conversion algorithm for source images to 1-bit bitmaps: "threshold" or "dither"
-icon_conversion: threshold
-```
-
-The `defaultBaudRate` constant in `config.go` must be updated to 115200.
+| Key | Status | Notes |
+|---|---|---|
+| `com_port` | ✓ existing | |
+| `baud_rate` | ✓ updated | Default changed to 115200 |
+| `slider_mapping` | ✓ existing | 6-channel SERENITY layout in default config |
+| `channel_names` | ✓ implemented | List of 5 strings for channel OLEDs 1–5 |
+| `icon_path` | pending | Path to icon source files; add when icon package is implemented |
+| `icon_conversion` | pending | `"threshold"` or `"dither"`; add when icon package is implemented |
 
 ---
 
-## Planned Features
+## Feature Status
 
-### 1. Bidirectional Serial Protocol
+### ✓ 1. Bidirectional Serial Protocol — COMPLETE
 
 All host → firmware commands use binary framing:
 
@@ -89,76 +66,61 @@ All host → firmware commands use binary framing:
 - `0x00` (null byte) is the escape prefix — never appears in ASCII fader data, unambiguous
 - `LEN` is payload length in bytes, little-endian 16-bit
 - **Fire-and-forget** — no ACK, no retry; USB CDC serial reliability is sufficient
-- **Host traffic takes priority.** Collisions with outgoing fader data are rare due to event-driven firmware, and UART TX/RX are hardware-independent
 
-**Defined commands** (CMD_IDs to be assigned at implementation time):
+**Assigned CMD_IDs:**
 
-| Name | Payload | Description |
-|---|---|---|
-| `CMD_QUERY` | none | Host → firmware: request ready beacon |
-| `SET_CHANNEL_NAME` | `[channel_idx][name\0]` | Push display name for channel N |
-| `SET_CHANNEL_ICON` | `[channel_idx][bitmap bytes]` | Push icon bitmap for channel N |
+| Name | CMD_ID | Payload | Description |
+|---|---|---|---|
+| `CMD_QUERY` | `0x01` | none | Host → firmware: request ready beacon |
+| `SET_CHANNEL_NAME` | `0x02` | `[channel_idx][name\0]` | Push display name for channel N |
+| `SET_CHANNEL_ICON` | `0x03` | `[channel_idx][bitmap bytes]` | Push icon bitmap for channel N |
 
-### 2. Connection Handshake and Icon Push Trigger
+Implemented in `serial_writer.go`. `SerialWriter` is created by `SerialIO` on connect and exposed via `SerialIO.Writer()`.
 
-The host must push icons and names to the firmware on every connection. Two scenarios must both be handled:
+### ✓ 2. Connection Handshake and Push Trigger — COMPLETE
+
+Both connection scenarios are handled:
 
 **Device connects while host is already running:**
 - Firmware sends `SERENITY\r\n` after its 1500ms startup delay
-- Host detects this line (does not match fader pattern), triggers icon push
+- `serial.go` detects this line before the fader pattern check, notifies beacon consumers
 
 **Host launches with device already connected:**
-- Host sends `CMD_QUERY` immediately on successfully opening the serial port
+- `display.go` receives the connect event, sends `CMD_QUERY` immediately
 - Firmware responds with `SERENITY\r\n`
-- Host receives beacon and triggers icon push
+- Beacon received → push triggered
 
-`SERENITY\r\n` is the shared ready signal for both paths. The host pushes all 5 channel names then all 5 channel icons on receipt, regardless of how the beacon was produced.
+**Manual trigger:** "Push display icons" tray menu item calls `display.TriggerPush()`, skipping unchanged channels.
 
-**Manual trigger:** a tray menu item ("Push display icons") fires the same push sequence on demand, without requiring a reconnect.
+**Host-side change detection:** `DisplayManager` tracks `lastSentNames` and `lastSentIcons` per channel. Connection events force-push all channels; manual pushes skip unchanged ones.
 
-**Host-side change detection:** the host tracks the last successfully sent name and icon per channel. On a manual push, unchanged channels are skipped. On a connection event, all channels are always pushed (device state after reset is unknown).
+Implemented in `display.go` and `serial.go` (connect/beacon pub-sub channels).
 
-### 3. Icon and Name Streaming
+### ✓ 3. Channel Name Streaming — COMPLETE
 
-Channel displays (OLEDs 1–5) show a text name in the yellow band (top 16px) and a bitmap icon in the blue area (bottom 48px). Both are sourced from the host and pushed over the bidirectional serial protocol. The master OLED is entirely firmware-controlled and receives nothing from the host.
+Names are pushed via `SET_CHANNEL_NAME` on every connection event and on manual push.
 
-**Naming commands (`SET_CHANNEL_NAME`):**
-- Payload: 1-byte channel index (0–4) + null-terminated ASCII string
-- `MaxChannelNameLength = 15` — named constant in host code; value will be revisited when firmware font size is finalized
-- Firmware stores the name string in RAM for redraws
+- Source: `channel_names` list in `config.yaml`, read into `CanonicalConfig.ChannelNames [5]string`
+- `MaxChannelNameLength = 15` (constant in `serial_writer.go`; revisit when firmware font size is finalized)
+- Config reload automatically picks up new names on the next manual push
 
-**Icon commands (`SET_CHANNEL_ICON`):**
-- Payload: 1-byte channel index (0–4) + raw 1-bit bitmap bytes
-- Firmware pipes bytes directly to the target OLED via I2C without buffering the full bitmap in MCU RAM
-- LEN field in the command header specifies exact byte count; icon size is therefore flexible in the protocol
+Icon streaming is **pending** — see TBD section.
 
-**Icon library:**
-- Icons are keyed by channel index, not by app name — the icon for channel N is displayed on OLED N regardless of what app is mapped to that slider
-- Source files stored at the path specified by `icon_path` in `config.yaml`
-- Naming convention: TBD (depends on final file format decision)
-- File format: TBD (PNG likely, but format will be chosen based on what produces the best quality for dot-matrix displays)
-- Icon dimensions: TBD — must fit within 128×48px blue area; exact size TBD
-- Conversion to 1-bit: both threshold and Floyd-Steinberg dithering supported, selected via `icon_conversion` in `config.yaml`. Threshold is better for clean line art; dithering is better for grayscale sources. No meaningful difference in storage, transmit time, or CPU cost at these image sizes.
-- **Bitmap bit order: TBD** — must match the firmware's direct SSD1306 write implementation. Do not assume MSB-first or LSB-first until the firmware's icon write path is implemented and documented in the firmware CLAUDE.md.
-
-**Fallback:** if no icon file is found for a channel, the host sends a generated bitmap of a large X filling the icon area. This also serves as the initial hardware test image.
-
-### 4. System Mic Mute via HID
-
-The SERENITY RGB button sends a custom HID report when pressed. The host intercepts this and toggles the system microphone mute state via OS audio APIs.
+### ✓ 4. System Mic Mute via HID — COMPLETE (report validation pending TBD)
 
 **Device identification:**
-- USB VID: `0x1209` (pid.codes open-source VID)
-- USB PID: `0x0001`
+- USB VID: `0x1209`, USB PID: `0x0001`
 - SERENITY enumerates as a composite USB device: CDC serial + HID
 
-**HID implementation:**
-- Cross-platform hidapi library (Go wrapper, e.g. `sstallman/go-hid`) for device enumeration and report reading
-- Mic mute toggle abstracted behind a Go interface with `_windows.go` and `_linux.go` implementations, following the same pattern as `session_finder_windows.go` / `session_finder_linux.go`
-- Windows: WASAPI/MMDeviceAPI (COM) to toggle default recording device mute
-- Linux: PulseAudio/PipeWire via `pactl` or Go bindings
+**HID implementation (pure Go, no CGO):**
+- Windows: enumerates HID devices via `setupapi.dll` and `hid.dll` using `syscall.NewLazyDLL` — no C compiler required
+- Device matched by VID/PID string in the device path, opened with `CreateFile`, read with `ReadFile`
+- `MicMuter` interface with `_windows.go` / `_linux.go` implementations
+- Windows mic mute: WASAPI/MMDeviceAPI (`go-wca`, already a dependency) to toggle default recording device mute
+- Linux mic mute: `pactl set-source-mute @DEFAULT_SOURCE@ toggle` (best-effort)
+- Linux HID enumeration: not yet implemented (`openSERENITY` returns an error; HID manager retries silently)
 
-**Custom HID report format: TBD** — co-designed with firmware when the RGB button hardware replacement (common-anode button, currently on order) is installed and the firmware's HID descriptor is finalized. The Consumer Control report (Play/Pause = `0x00CD`) is already implemented in firmware and handled by the OS natively; only the mic mute custom report requires host-side handling.
+**Pending:** `handleReport` in `hid.go` currently triggers mute on any received report. Once the firmware HID descriptor is finalized, add a report format check there.
 
 ---
 
@@ -166,35 +128,55 @@ The SERENITY RGB button sends a custom HID report when pressed. The host interce
 
 ```
 pkg/deej/
-  cmd/main.go              — entry point
-  deej.go                  — main Deej struct, lifecycle
-  config.go                — config loading (viper); add new config keys here
-  serial.go                — serial I/O, fader parsing, outbound command writer
-  session.go               — audio session abstraction
-  session_map.go           — slider → session mapping
-  session_finder.go        — interface
+  cmd/main.go                  — entry point
+  deej.go                      — main Deej struct, lifecycle
+  config.go                    — config loading (viper)
+  serial.go                    — serial I/O, fader parsing, connect/beacon events
+  serial_writer.go             — host → firmware command framing (binary protocol)
+  display.go                   — handshake, name push sequencing, change tracking
+  hid.go                       — HIDManager, MicMuter interface, read loop
+  hid_windows.go               — Win32 HID enumeration + WASAPI mic mute
+  hid_linux.go                 — Linux stubs (HID enumeration TBD, mic mute via pactl)
+  session.go                   — audio session abstraction
+  session_map.go               — slider → session mapping
+  session_finder.go            — interface
   session_finder_windows.go
   session_finder_linux.go
-  tray.go                  — system tray; add "Push display icons" menu item here
-  notify.go                — desktop notifications
+  tray.go                      — system tray (includes "Push display icons" item)
+  notify.go                    — desktop notifications
   logger.go
+  panic.go                     — crash handler
   util/util.go
   util/util_windows.go
   util/util_linux.go
+  icon/icon.go                 — tray/notification icon data (generated, do not edit)
+
+  icon/                        — TO BE CREATED
+    icon.go                    — icon loading, conversion (threshold + dither), fallback X generation
 ```
 
-**New files to be created:**
+---
 
-```
-pkg/deej/
-  serial_writer.go         — host → firmware command framing and send logic
-  display.go               — connection handshake, icon push sequencing, change tracking
-  hid.go                   — HID interface definition + device enumeration
-  hid_windows.go           — Windows HID + mic mute implementation
-  hid_linux.go             — Linux HID + mic mute implementation (best-effort)
-  icon/
-    icon.go                — icon loading, conversion (threshold + dither), fallback X generation
-```
+## Remaining Work
+
+### Icon Package (`pkg/deej/icon/` — new package, separate from existing `icon/icon.go`)
+
+Blocked on firmware TBDs. Once unblocked:
+
+1. Add `icon_path` and `icon_conversion` keys to `config.go` and `config.yaml`
+2. Implement `pkg/deej/icon/icon.go`:
+   - Load source images from `icon_path` (format TBD)
+   - Convert to 1-bit bitmap: threshold (clean line art) or Floyd-Steinberg dither (grayscale)
+   - Generate fallback X bitmap if no source file found
+3. Wire into `display.go` `pushAll()` — the icon push TODO is already marked there
+
+### HID Report Validation
+
+One-line fill-in once firmware HID descriptor is known. See `handleReport` in `hid.go`.
+
+### Linux HID Enumeration
+
+Best-effort. Implement `openSERENITY()` in `hid_linux.go` by enumerating `/dev/hidraw*` and matching VID/PID via `/sys/class/hidraw/<dev>/device/uevent`.
 
 ---
 
@@ -202,11 +184,12 @@ pkg/deej/
 
 | Feature | Windows | Linux |
 |---|---|---|
-| Fader/serial reading | ✓ (upstream) | ✓ (upstream) |
+| Fader/serial reading | ✓ | ✓ |
 | Bidirectional serial | ✓ | ✓ |
-| Icon/name streaming | ✓ | ✓ |
-| HID device reading | ✓ | ✓ (hidraw) |
-| Mic mute toggle | ✓ (WASAPI) | best-effort (PulseAudio/PipeWire) |
+| Channel name streaming | ✓ | ✓ |
+| Icon streaming | pending TBD | pending TBD |
+| HID device reading | ✓ | stub (retries silently) |
+| Mic mute toggle | ✓ (WASAPI) | best-effort (pactl) |
 
 ---
 
@@ -219,8 +202,6 @@ pkg/deej/
 | Icon dimensions (px) | Firmware font size / display layout finalization |
 | Bitmap bit order for SET_CHANNEL_ICON | Firmware direct SSD1306 write implementation |
 | Custom HID report format (mic mute) | RGB button hardware replacement + firmware HID descriptor |
-| CMD_ID byte values | Implementation (assign at development time) |
-| Linux mic mute implementation details | Development |
 
 ---
 
