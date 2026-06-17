@@ -17,11 +17,11 @@ const (
 	crashlogTimestampFormat = "2006.01.02-15.04.05"
 
 	crashMessage = `-----------------------------------------------------------------
-                        deej crashlog
+                      deej-x crashlog
 -----------------------------------------------------------------
-Unfortunately, deej has crashed. This really shouldn't happen!
-If you've just encountered this, please contact @omriharel and attach this error log.
-You can also join the deej Discord server at https://discord.gg/nf88NJu.
+Unfortunately, deej-x has crashed. This really shouldn't happen!
+Please check the stack trace below and report the issue at
+https://github.com/sclead03/deej-x along with this log file.
 -----------------------------------------------------------------
 Time: %s
 Panic occurred: %s
