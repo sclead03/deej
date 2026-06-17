@@ -14,6 +14,14 @@ slider_mapping:
   4: deej.unmapped
   5: deej.unmapped
 
+# display names for SERENITY channel OLEDs (indices 0-4, corresponding to faders 1-5)
+channel_names:
+  - Browser
+  - Spotify
+  - Discord
+  - Game
+  - Aux
+
 # set this to true if you want the controls inverted (i.e. top is 0%, bottom is 100%)
 invert_sliders: false
 

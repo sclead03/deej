@@ -9,7 +9,7 @@ import (
 
 	"go.uber.org/zap"
 
-	"github.com/omriharel/deej/pkg/deej/util"
+	"github.com/sclead03/deej-x/pkg/deej/util"
 )
 
 const (
@@ -25,6 +25,7 @@ type Deej struct {
 	config   *CanonicalConfig
 	serial   *SerialIO
 	sessions *sessionMap
+	display  *DisplayManager
 
 	stopChannel chan bool
 	version     string
@@ -76,6 +77,14 @@ func NewDeej(logger *zap.SugaredLogger, verbose bool) (*Deej, error) {
 	}
 
 	d.sessions = sessions
+
+	display, err := NewDisplayManager(d, logger)
+	if err != nil {
+		logger.Errorw("Failed to create DisplayManager", "error", err)
+		return nil, fmt.Errorf("create new DisplayManager: %w", err)
+	}
+
+	d.display = display
 
 	logger.Debug("Created deej instance")
 

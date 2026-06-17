@@ -3,8 +3,8 @@ package deej
 import (
 	"github.com/getlantern/systray"
 
-	"github.com/omriharel/deej/pkg/deej/icon"
-	"github.com/omriharel/deej/pkg/deej/util"
+	"github.com/sclead03/deej-x/pkg/deej/icon"
+	"github.com/sclead03/deej-x/pkg/deej/util"
 )
 
 func (d *Deej) initializeTray(onDone func()) {
@@ -22,6 +22,8 @@ func (d *Deej) initializeTray(onDone func()) {
 
 		refreshSessions := systray.AddMenuItem("Re-scan audio sessions", "Manually refresh audio sessions if something's stuck")
 		refreshSessions.SetIcon(icon.RefreshSessions)
+
+		pushDisplays := systray.AddMenuItem("Push display icons", "Resend channel names and icons to SERENITY")
 
 		if d.version != "" {
 			systray.AddSeparator()
@@ -63,6 +65,11 @@ func (d *Deej) initializeTray(onDone func()) {
 					// performance: the reason that forcing a refresh here is okay is that users can't spam the
 					// right-click -> select-this-option sequence at a rate that's meaningful to performance
 					d.sessions.refreshSessions(true)
+
+				// push display icons
+				case <-pushDisplays.ClickedCh:
+					logger.Info("Push display icons menu item clicked")
+					d.display.TriggerPush()
 				}
 			}
 		}()

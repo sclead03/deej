@@ -10,7 +10,7 @@ import (
 	"github.com/spf13/viper"
 	"go.uber.org/zap"
 
-	"github.com/omriharel/deej/pkg/deej/util"
+	"github.com/sclead03/deej-x/pkg/deej/util"
 )
 
 // CanonicalConfig provides application-wide access to configuration fields,
@@ -23,9 +23,9 @@ type CanonicalConfig struct {
 		BaudRate int
 	}
 
-	InvertSliders bool
-
+	InvertSliders       bool
 	NoiseReductionLevel string
+	ChannelNames        [numChannels]string
 
 	logger             *zap.SugaredLogger
 	notifier           Notifier
@@ -53,6 +53,7 @@ const (
 	configKeyCOMPort             = "com_port"
 	configKeyBaudRate            = "baud_rate"
 	configKeyNoiseReductionLevel = "noise_reduction"
+	configKeyChannelNames        = "channel_names"
 
 	defaultCOMPort  = "COM4"
 	defaultBaudRate = 115200
@@ -89,6 +90,7 @@ func NewConfig(logger *zap.SugaredLogger, notifier Notifier) (*CanonicalConfig, 
 	userConfig.SetDefault(configKeyInvertSliders, false)
 	userConfig.SetDefault(configKeyCOMPort, defaultCOMPort)
 	userConfig.SetDefault(configKeyBaudRate, defaultBaudRate)
+	userConfig.SetDefault(configKeyChannelNames, []string{})
 
 	internalConfig := viper.New()
 	internalConfig.SetConfigName(internalConfigName)
@@ -146,7 +148,8 @@ func (cc *CanonicalConfig) Load() error {
 	cc.logger.Infow("Config values",
 		"sliderMapping", cc.SliderMapping,
 		"connectionInfo", cc.ConnectionInfo,
-		"invertSliders", cc.InvertSliders)
+		"invertSliders", cc.InvertSliders,
+		"channelNames", cc.ChannelNames)
 
 	return nil
 }
@@ -238,6 +241,11 @@ func (cc *CanonicalConfig) populateFromVipers() error {
 
 	cc.InvertSliders = cc.userConfig.GetBool(configKeyInvertSliders)
 	cc.NoiseReductionLevel = cc.userConfig.GetString(configKeyNoiseReductionLevel)
+
+	names := cc.userConfig.GetStringSlice(configKeyChannelNames)
+	for i := 0; i < numChannels && i < len(names); i++ {
+		cc.ChannelNames[i] = names[i]
+	}
 
 	cc.logger.Debug("Populated config fields from vipers")
 

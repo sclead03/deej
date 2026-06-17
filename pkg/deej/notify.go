@@ -7,8 +7,8 @@ import (
 	"github.com/gen2brain/beeep"
 	"go.uber.org/zap"
 
-	"github.com/omriharel/deej/pkg/deej/icon"
-	"github.com/omriharel/deej/pkg/deej/util"
+	"github.com/sclead03/deej-x/pkg/deej/icon"
+	"github.com/sclead03/deej-x/pkg/deej/util"
 )
 
 // Notifier provides generic notification sending

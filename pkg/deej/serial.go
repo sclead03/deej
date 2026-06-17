@@ -13,7 +13,7 @@ import (
 	"github.com/jacobsa/go-serial/serial"
 	"go.uber.org/zap"
 
-	"github.com/omriharel/deej/pkg/deej/util"
+	"github.com/sclead03/deej-x/pkg/deej/util"
 )
 
 // SerialIO provides a deej-aware abstraction layer to managing serial I/O
@@ -33,6 +33,10 @@ type SerialIO struct {
 	currentSliderPercentValues []float32
 
 	sliderMoveConsumers []chan SliderMoveEvent
+	connectedConsumers  []chan struct{}
+	beaconConsumers     []chan struct{}
+
+	writer *SerialWriter
 }
 
 // SliderMoveEvent represents a single slider move captured by deej
@@ -55,6 +59,8 @@ func NewSerialIO(deej *Deej, logger *zap.SugaredLogger) (*SerialIO, error) {
 		connected:           false,
 		conn:                nil,
 		sliderMoveConsumers: []chan SliderMoveEvent{},
+		connectedConsumers:  []chan struct{}{},
+		beaconConsumers:     []chan struct{}{},
 	}
 
 	logger.Debug("Created serial i/o instance")
@@ -107,6 +113,11 @@ func (sio *SerialIO) Start() error {
 
 	namedLogger.Infow("Connected", "conn", sio.conn)
 	sio.connected = true
+	sio.writer = NewSerialWriter(sio.conn, sio.logger)
+
+	for _, consumer := range sio.connectedConsumers {
+		go func(ch chan struct{}) { ch <- struct{}{} }(consumer)
+	}
 
 	// read lines or await a stop
 	go func() {
@@ -142,6 +153,27 @@ func (sio *SerialIO) SubscribeToSliderMoveEvents() chan SliderMoveEvent {
 	ch := make(chan SliderMoveEvent)
 	sio.sliderMoveConsumers = append(sio.sliderMoveConsumers, ch)
 
+	return ch
+}
+
+// Writer returns the active SerialWriter, or nil if not connected.
+func (sio *SerialIO) Writer() *SerialWriter {
+	return sio.writer
+}
+
+// SubscribeToConnectEvents returns a channel that receives a signal each time
+// a serial connection is successfully opened.
+func (sio *SerialIO) SubscribeToConnectEvents() chan struct{} {
+	ch := make(chan struct{})
+	sio.connectedConsumers = append(sio.connectedConsumers, ch)
+	return ch
+}
+
+// SubscribeToBeaconEvents returns a channel that receives a signal each time
+// the SERENITY ready beacon is received.
+func (sio *SerialIO) SubscribeToBeaconEvents() chan struct{} {
+	ch := make(chan struct{})
+	sio.beaconConsumers = append(sio.beaconConsumers, ch)
 	return ch
 }
 
@@ -194,6 +226,7 @@ func (sio *SerialIO) close(logger *zap.SugaredLogger) {
 	}
 
 	sio.conn = nil
+	sio.writer = nil
 	sio.connected = false
 }
 
@@ -226,6 +259,14 @@ func (sio *SerialIO) readLine(logger *zap.SugaredLogger, reader *bufio.Reader) c
 }
 
 func (sio *SerialIO) handleLine(logger *zap.SugaredLogger, line string) {
+
+	if line == "SERENITY\r\n" {
+		logger.Info("Received SERENITY beacon")
+		for _, consumer := range sio.beaconConsumers {
+			go func(ch chan struct{}) { ch <- struct{}{} }(consumer)
+		}
+		return
+	}
 
 	// this function receives an unsanitized line which is guaranteed to end with LF,
 	// but most lines will end with CRLF. it may also have garbage instead of
