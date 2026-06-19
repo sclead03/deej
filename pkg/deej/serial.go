@@ -128,7 +128,15 @@ func (sio *SerialIO) Start() error {
 			select {
 			case <-sio.stopChannel:
 				sio.close(namedLogger)
-			case line := <-lineChannel:
+				return
+			case line, ok := <-lineChannel:
+				if !ok {
+					// Read goroutine exited — device was unplugged.
+					namedLogger.Info("Serial device disconnected")
+					sio.close(namedLogger)
+					go sio.reconnect()
+					return
+				}
 				sio.handleLine(namedLogger, line)
 			}
 		}
@@ -230,10 +238,22 @@ func (sio *SerialIO) close(logger *zap.SugaredLogger) {
 	sio.connected = false
 }
 
+func (sio *SerialIO) reconnect() {
+	sio.logger.Info("Waiting for serial device to reappear")
+	for {
+		waitForSerialDevice(sio.logger)
+		if err := sio.Start(); err == nil {
+			return
+		}
+		sio.logger.Debug("Reconnect attempt failed, waiting for next device arrival")
+	}
+}
+
 func (sio *SerialIO) readLine(logger *zap.SugaredLogger, reader *bufio.Reader) chan string {
 	ch := make(chan string)
 
 	go func() {
+		defer close(ch)
 		for {
 			line, err := reader.ReadString('\n')
 			if err != nil {
@@ -242,7 +262,6 @@ func (sio *SerialIO) readLine(logger *zap.SugaredLogger, reader *bufio.Reader) c
 					logger.Warnw("Failed to read line from serial", "error", err, "line", line)
 				}
 
-				// just ignore the line, the read loop will stop after this
 				return
 			}
 
@@ -250,7 +269,6 @@ func (sio *SerialIO) readLine(logger *zap.SugaredLogger, reader *bufio.Reader) c
 				logger.Debugw("Read new line", "line", line)
 			}
 
-			// deliver the line to the channel
 			ch <- line
 		}
 	}()

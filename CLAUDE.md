@@ -48,8 +48,8 @@ Index 0 maps in `config.yaml` like any other channel (`slider_mapping: 0: master
 | `baud_rate` | ✓ updated | Default changed to 115200 |
 | `slider_mapping` | ✓ existing | 6-channel SERENITY layout in default config |
 | `channel_names` | ✓ implemented | List of 5 strings for channel OLEDs 1–5 |
-| `icon_dir` | pending | Directory containing PNG icon files; relative or absolute path |
-| `icon_conversion` | pending | `"dither"` (Floyd-Steinberg) or `"threshold"`; user chooses per preference |
+| `icon_dir` | ✓ implemented | Directory containing PNG icon files; relative or absolute path |
+| `icon_conversion` | ✓ implemented | Per-channel list: `"dither"` (Floyd-Steinberg) or `"threshold"`; scalar value applies to all channels |
 
 ---
 
@@ -82,19 +82,25 @@ Implemented in `serial_writer.go`. `SerialWriter` is created by `SerialIO` on co
 Both connection scenarios are handled:
 
 **Device connects while host is already running:**
-- Firmware sends `SERENITY\r\n` after its 1500ms startup delay
-- `serial.go` detects this line before the fader pattern check, notifies beacon consumers
+- `hotplug_windows.go` registers a `WM_DEVICECHANGE` / `DBT_DEVICEARRIVAL` listener via a message-only window and `RegisterDeviceNotificationW` (GUID_DEVINTERFACE_COMPORT)
+- On arrival, waits 500ms for the CDC driver to settle, then opens the serial port
+- Connect event fires → `CMD_QUERY` sent → `SERENITY\r\n` beacon → push triggered
 
 **Host launches with device already connected:**
 - `display.go` receives the connect event, sends `CMD_QUERY` immediately
 - Firmware responds with `SERENITY\r\n`
 - Beacon received → push triggered
 
+**Device unplugged and replugged while host is running:**
+- `readLine` goroutine closes its channel on read error
+- `Start()` goroutine detects closed channel → calls `close()` → spawns `reconnect()` goroutine
+- `reconnect()` calls `waitForSerialDevice()` (same hotplug path) then retries `Start()`
+
 **Manual trigger:** "Push display icons" tray menu item calls `display.TriggerPush()`, skipping unchanged channels.
 
 **Host-side change detection:** `DisplayManager` tracks `lastSentNames` and `lastSentIcons` per channel. Connection events force-push all channels; manual pushes skip unchanged ones.
 
-Implemented in `display.go` and `serial.go` (connect/beacon pub-sub channels).
+Implemented in `display.go`, `serial.go`, and `hotplug_windows.go`.
 
 ### ✓ 3. Channel Name Streaming — COMPLETE
 
@@ -110,8 +116,10 @@ Icons are pushed via `SET_CHANNEL_ICON` on every connection event and on manual 
 
 - Source: PNG files in `icon_dir` (config key), named after the process with `.exe` stripped (`chrome.png`, `spotify.png`)
 - `deej.unmapped` maps to `unmapped.png`; `system` maps to `system.png`; `master` slot is skipped
-- Conversion: configurable via `icon_conversion` — `"dither"` (Floyd-Steinberg) or `"threshold"`
-- Pipeline: load PNG → box-filter resize to 48×48 → composite on black → grayscale → 1-bit → pack to 768-byte SSD1306 page-order frame (40px horizontal zero-padding each side)
+- Conversion: per-channel, configurable via `icon_conversion` list — `"dither"` (Floyd-Steinberg) or `"threshold"`; a scalar value in config.yaml applies to all channels
+- Pipeline (transparent PNG): detect alpha → box-filter resize alpha channel to 48×48 → use alpha as content mask (transparent=off, opaque=on); apply dither or threshold to alpha values for edge softening
+- Pipeline (opaque PNG): box-filter resize RGB to 48×48 → grayscale → threshold or Floyd-Steinberg dither → 1-bit
+- Output: 768-byte SSD1306 page-order frame; 48×48 icon centered horizontally with 40px zero-padding each side
 - Implemented in `pkg/deej/icon/channel_icon.go` (`icon.Load`), wired into `display.go` `pushAll()`
 - Missing icon files are logged at debug level and skipped gracefully (no crash)
 - `lastSentIcons` change tracking prevents redundant re-sends on manual push
@@ -147,6 +155,8 @@ pkg/deej/
   hid.go                       — HIDManager, MicMuter interface, read loop
   hid_windows.go               — Win32 HID enumeration + WASAPI mic mute
   hid_linux.go                 — Linux stubs (HID enumeration TBD, mic mute via pactl)
+  hotplug_windows.go           — WM_DEVICECHANGE COM port arrival listener (message-only window)
+  hotplug_linux.go             — Linux stub (2s delay fallback)
   session.go                   — audio session abstraction
   session_map.go               — slider → session mapping
   session_finder.go            — interface
@@ -160,9 +170,7 @@ pkg/deej/
   util/util_windows.go
   util/util_linux.go
   icon/icon.go                 — tray/notification icon data (generated, do not edit)
-
-  icon/                        — TO BE CREATED
-    icon.go                    — icon loading, conversion (threshold + dither), fallback X generation
+  icon/channel_icon.go         — OLED icon pipeline: Load(), box resize, threshold/dither, packSSD1306()
 ```
 
 ---
@@ -187,6 +195,8 @@ Best-effort. Implement `openSERENITY()` in `hid_linux.go` by enumerating `/dev/h
 | Bidirectional serial | ✓ | ✓ |
 | Channel name streaming | ✓ | ✓ |
 | Icon streaming | ✓ | ✓ |
+| Serial hotplug (device arrives after host) | ✓ (WM_DEVICECHANGE) | fallback (2s retry) |
+| Serial reconnect (device unplugged/replugged) | ✓ | ✓ |
 | HID device reading | ✓ | stub (retries silently) |
 | Mic mute toggle | ✓ (WASAPI) | best-effort (pactl) |
 

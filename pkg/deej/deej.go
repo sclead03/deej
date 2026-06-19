@@ -162,31 +162,24 @@ func (d *Deej) run() {
 	// start HID device watcher
 	d.hid.Start()
 
-	// connect to SERENITY for the first time
+	// connect to SERENITY; wait for device arrival if it isn't plugged in yet
 	go func() {
-		if err := d.serial.Start(); err != nil {
-			d.logger.Warnw("Failed to start first-time serial connection", "error", err)
-
-			// If the port is busy, that's because something else is connected - notify and quit
-			if errors.Is(err, os.ErrPermission) {
-				d.logger.Warnw("Serial port seems busy, notifying user and closing",
+		for {
+			if err := d.serial.Start(); err != nil {
+				if errors.Is(err, os.ErrPermission) {
+					d.logger.Warnw("Serial port busy, notifying and closing",
+						"comPort", d.config.ConnectionInfo.COMPort)
+					d.notifier.Notify(fmt.Sprintf("Can't connect to %s!", d.config.ConnectionInfo.COMPort),
+						"This serial port is busy, make sure to close any serial monitor or other deej instance.")
+					d.signalStop()
+					return
+				}
+				d.logger.Debugw("Serial not available, waiting for device arrival",
 					"comPort", d.config.ConnectionInfo.COMPort)
-
-				d.notifier.Notify(fmt.Sprintf("Can't connect to %s!", d.config.ConnectionInfo.COMPort),
-					"This serial port is busy, make sure to close any serial monitor or other deej instance.")
-
-				d.signalStop()
-
-				// also notify if the COM port they gave isn't found, maybe their config is wrong
-			} else if errors.Is(err, os.ErrNotExist) {
-				d.logger.Warnw("Provided COM port seems wrong, notifying user and closing",
-					"comPort", d.config.ConnectionInfo.COMPort)
-
-				d.notifier.Notify(fmt.Sprintf("Can't connect to %s!", d.config.ConnectionInfo.COMPort),
-					"This serial port doesn't exist, check your configuration and make sure it's set correctly.")
-
-				d.signalStop()
+				waitForSerialDevice(d.logger)
+				continue
 			}
+			return
 		}
 	}()
 
