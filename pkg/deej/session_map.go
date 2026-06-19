@@ -345,6 +345,17 @@ func (m *sessionMap) get(key string) ([]Session, bool) {
 	return value, ok
 }
 
+// getMasterVolume returns the current master output volume scalar (0.0–1.0),
+// or false if the master session isn't currently available.
+func (m *sessionMap) getMasterVolume() (float32, bool) {
+	sessions, ok := m.get(masterSessionName)
+	if !ok || len(sessions) == 0 {
+		return 0, false
+	}
+
+	return sessions[0].GetVolume(), true
+}
+
 func (m *sessionMap) clear() {
 	m.lock.Lock()
 	defer m.lock.Unlock()

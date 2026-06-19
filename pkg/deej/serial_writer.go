@@ -12,10 +12,12 @@ import (
 // Command IDs for the host → firmware binary protocol.
 // Frame format: [0x00][cmdID][lenLo][lenHi][...payload...]
 const (
-	cmdPrefix      = byte(0x00)
-	cmdQuery       = byte(0x01)
-	cmdSetChName   = byte(0x02)
-	cmdSetChIcon   = byte(0x03)
+	cmdPrefix          = byte(0x00)
+	cmdQuery           = byte(0x01)
+	cmdSetChName       = byte(0x02)
+	cmdSetChIcon       = byte(0x03)
+	cmdSetMasterVol    = byte(0x04)
+	cmdSetMicMuteState = byte(0x05)
 
 	// MaxChannelNameLength is the maximum number of characters in a channel display
 	// name (excluding the null terminator). Revisit when firmware font size is finalized.
@@ -62,6 +64,25 @@ func (sw *SerialWriter) SendChannelIcon(idx byte, bitmap []byte) error {
 	payload = append(payload, idx)
 	payload = append(payload, bitmap...)
 	return sw.send(cmdSetChIcon, payload)
+}
+
+// SendMasterVolume pushes the current master volume, raw 0–1023 (same domain as
+// the firmware's own masterVol), so SERENITY can sync its encoder/display state
+// instead of booting hard-coded.
+func (sw *SerialWriter) SendMasterVolume(raw uint16) error {
+	payload := make([]byte, 2)
+	binary.LittleEndian.PutUint16(payload, raw)
+	return sw.send(cmdSetMasterVol, payload)
+}
+
+// SendMicMuteState pushes the current system microphone mute state so SERENITY's
+// RGB button LED can sync to it instead of booting unmuted.
+func (sw *SerialWriter) SendMicMuteState(muted bool) error {
+	payload := []byte{0x00}
+	if muted {
+		payload[0] = 0x01
+	}
+	return sw.send(cmdSetMicMuteState, payload)
 }
 
 func (sw *SerialWriter) send(cmdID byte, payload []byte) error {

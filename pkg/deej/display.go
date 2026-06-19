@@ -73,10 +73,34 @@ func (dm *DisplayManager) subscribeToSerialEvents() {
 					dm.logger.Warn("Beacon received but writer is nil")
 					continue
 				}
+				dm.pushMasterState(writer)
 				dm.pushAll(writer, true)
 			}
 		}
 	}()
+}
+
+// pushMasterState sends the current master volume and mic mute state, so SERENITY
+// can sync its encoder/display/RGB state instead of booting to hard-coded defaults.
+func (dm *DisplayManager) pushMasterState(writer *SerialWriter) {
+	if vol, ok := dm.deej.sessions.getMasterVolume(); ok {
+		raw := uint16(vol*1023 + 0.5)
+		if err := writer.SendMasterVolume(raw); err != nil {
+			dm.logger.Warnw("Failed to send master volume", "error", err)
+		} else {
+			dm.logger.Debugw("Sent master volume", "raw", raw)
+		}
+	} else {
+		dm.logger.Debug("Master session not available, skipping master volume push")
+	}
+
+	if muted, err := dm.deej.hid.IsMicMuted(); err != nil {
+		dm.logger.Debugw("Failed to get mic mute state, skipping push", "error", err)
+	} else if err := writer.SendMicMuteState(muted); err != nil {
+		dm.logger.Warnw("Failed to send mic mute state", "error", err)
+	} else {
+		dm.logger.Debugw("Sent mic mute state", "muted", muted)
+	}
 }
 
 // pushAll sends names and icons for all channels. force=true (connection event) sends

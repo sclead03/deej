@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"os/exec"
+	"strings"
 
 	"go.uber.org/zap"
 )
@@ -32,4 +33,14 @@ func (m *linuxMicMuter) ToggleMute() error {
 
 	m.logger.Debug("Toggled mic mute via pactl")
 	return nil
+}
+
+// IsMuted reports the current system microphone mute state via pactl.
+func (m *linuxMicMuter) IsMuted() (bool, error) {
+	out, err := exec.Command("pactl", "get-source-mute", "@DEFAULT_SOURCE@").Output()
+	if err != nil {
+		return false, fmt.Errorf("pactl get mic mute state: %w", err)
+	}
+
+	return strings.Contains(string(out), "yes"), nil
 }

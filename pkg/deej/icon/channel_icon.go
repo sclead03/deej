@@ -16,8 +16,8 @@ const (
 	IconHeight = 48
 
 	wireWidth   = 128
-	wirePages   = 6             // SSD1306 pages 2–7 (blue area, rows 16–63)
-	WireBytes   = wireWidth * wirePages // 768
+	wirePages   = 6                           // SSD1306 pages 2–7 (blue area, rows 16–63)
+	WireBytes   = wireWidth * wirePages       // 768
 	iconLeftPad = (wireWidth - IconWidth) / 2 // 40
 )
 

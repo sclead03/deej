@@ -15,9 +15,10 @@ const (
 	hidReconnectDelay = 2 * time.Second
 )
 
-// MicMuter toggles the system microphone mute state.
+// MicMuter toggles and reports the system microphone mute state.
 type MicMuter interface {
 	ToggleMute() error
+	IsMuted() (bool, error)
 }
 
 // HIDManager reads reports from the SERENITY HID interface and dispatches actions.
@@ -53,6 +54,11 @@ func (h *HIDManager) Start() {
 // Stop shuts down the HID manager.
 func (h *HIDManager) Stop() {
 	close(h.stopCh)
+}
+
+// IsMicMuted returns the current system microphone mute state.
+func (h *HIDManager) IsMicMuted() (bool, error) {
+	return h.muter.IsMuted()
 }
 
 func (h *HIDManager) run() {

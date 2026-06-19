@@ -10,8 +10,8 @@ import (
 
 	ole "github.com/go-ole/go-ole"
 	wca "github.com/moutend/go-wca"
-	"golang.org/x/sys/windows"
 	"go.uber.org/zap"
+	"golang.org/x/sys/windows"
 )
 
 // setupapi.dll and hid.dll — loaded lazily, no CGO required
@@ -163,7 +163,9 @@ func newMicMuter(logger *zap.SugaredLogger) (MicMuter, error) {
 	return &windowsMicMuter{logger: logger.Named("mic_muter")}, nil
 }
 
-func (m *windowsMicMuter) ToggleMute() error {
+// withCaptureVolume initializes COM and the default capture endpoint's
+// IAudioEndpointVolume, then hands it to fn for the duration of the call.
+func (m *windowsMicMuter) withCaptureVolume(fn func(aev *wca.IAudioEndpointVolume) error) error {
 	if err := ole.CoInitializeEx(0, ole.COINIT_APARTMENTTHREADED); err != nil {
 		const eFalse = 1
 		oleError := &ole.OleError{}
@@ -198,15 +200,33 @@ func (m *windowsMicMuter) ToggleMute() error {
 	}
 	defer aev.Release()
 
+	return fn(aev)
+}
+
+func (m *windowsMicMuter) ToggleMute() error {
+	return m.withCaptureVolume(func(aev *wca.IAudioEndpointVolume) error {
+		var muted bool
+		if err := aev.GetMute(&muted); err != nil {
+			return fmt.Errorf("get mute state: %w", err)
+		}
+
+		if err := aev.SetMute(!muted, nil); err != nil {
+			return fmt.Errorf("set mute state: %w", err)
+		}
+
+		m.logger.Debugw("Toggled mic mute", "nowMuted", !muted)
+		return nil
+	})
+}
+
+// IsMuted reports the current system microphone mute state.
+func (m *windowsMicMuter) IsMuted() (bool, error) {
 	var muted bool
-	if err := aev.GetMute(&muted); err != nil {
-		return fmt.Errorf("get mute state: %w", err)
+	err := m.withCaptureVolume(func(aev *wca.IAudioEndpointVolume) error {
+		return aev.GetMute(&muted)
+	})
+	if err != nil {
+		return false, fmt.Errorf("get mute state: %w", err)
 	}
-
-	if err := aev.SetMute(!muted, nil); err != nil {
-		return fmt.Errorf("set mute state: %w", err)
-	}
-
-	m.logger.Debugw("Toggled mic mute", "nowMuted", !muted)
-	return nil
+	return muted, nil
 }

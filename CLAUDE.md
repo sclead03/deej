@@ -74,6 +74,8 @@ All host → firmware commands use binary framing:
 | `CMD_QUERY` | `0x01` | none | Host → firmware: request ready beacon |
 | `SET_CHANNEL_NAME` | `0x02` | `[channel_idx][name\0]` | Push display name for channel N |
 | `SET_CHANNEL_ICON` | `0x03` | `[channel_idx][bitmap bytes]` | Push icon bitmap for channel N |
+| `SET_MASTER_VOLUME` | `0x04` | `[vol_lo][vol_hi]` | Raw 0–1023, same domain as firmware's own `masterVol`; host's current master volume on connect |
+| `SET_MIC_MUTE_STATE` | `0x05` | `[muted]` | `0x00` unmuted / `0x01` muted; host's current system mic mute state on connect |
 
 Implemented in `serial_writer.go`. `SerialWriter` is created by `SerialIO` on connect and exposed via `SerialIO.Writer()`.
 
@@ -140,6 +142,16 @@ Icons are pushed via `SET_CHANNEL_ICON` on every connection event and on manual 
 
 **Pending:** `handleReport` in `hid.go` currently triggers mute on any received report. Once the firmware HID descriptor is finalized, add a report format check there.
 
+### ✓ 6. Master State Sync on Connect — HOST COMPLETE (firmware handler pending)
+
+Resolves the "master volume boots at 50%" issue: firmware's `masterVol` is hard-coded to 512 on power-on because it has no way to know the host's actual current state.
+
+- On every beacon (`display.go` beacon handler, before `pushAll`), `DisplayManager.pushMasterState` sends `SET_MASTER_VOLUME` with the current master output volume and `SET_MIC_MUTE_STATE` with the current system mic mute state
+- Master volume source: `sessionMap.getMasterVolume()` reads the `"master"` session's `GetVolume()` (0.0–1.0 scalar), converted to raw `0–1023` (`uint16(vol*1023 + 0.5)`) to match the firmware's native domain
+- Mic mute source: `HIDManager.IsMicMuted()` → `MicMuter.IsMuted()` (Windows: `IAudioEndpointVolume.GetMute` on the default capture endpoint; Linux: `pactl get-source-mute @DEFAULT_SOURCE@`)
+- If the master session or mic state isn't available (e.g. session map not yet populated), the corresponding push is skipped rather than guessed
+- **Firmware side not yet implemented** — needs a handler for `0x04`/`0x05` that assigns into `masterVol` and the RGB button's mic-mute state respectively, then a reflash to pick it up. Until then this push is sent but ignored by firmware.
+
 ---
 
 ## Codebase Structure
@@ -151,8 +163,8 @@ pkg/deej/
   config.go                    — config loading (viper)
   serial.go                    — serial I/O, fader parsing, connect/beacon events
   serial_writer.go             — host → firmware command framing (binary protocol)
-  display.go                   — handshake, name push sequencing, change tracking
-  hid.go                       — HIDManager, MicMuter interface, read loop
+  display.go                   — handshake, master state sync, name push sequencing, change tracking
+  hid.go                       — HIDManager, MicMuter interface (toggle + query mute state), read loop
   hid_windows.go               — Win32 HID enumeration + WASAPI mic mute
   hid_linux.go                 — Linux stubs (HID enumeration TBD, mic mute via pactl)
   hotplug_windows.go           — WM_DEVICECHANGE COM port arrival listener (message-only window)
@@ -177,6 +189,10 @@ pkg/deej/
 
 ## Remaining Work
 
+### Firmware Handler for Master State Sync
+
+Host sends `SET_MASTER_VOLUME` (`0x04`) and `SET_MIC_MUTE_STATE` (`0x05`) on every beacon (see Feature 6), but firmware has no handler for them yet — frames are sent and currently ignored. Needs a firmware-side command parser that assigns the received value into `masterVol` and the RGB button's mic-mute state, plus a reflash to pick it up. Lives in the SERENITY-Firmware repo, not here.
+
 ### HID Report Validation
 
 One-line fill-in once firmware HID descriptor is known. See `handleReport` in `hid.go`.
@@ -199,6 +215,7 @@ Best-effort. Implement `openSERENITY()` in `hid_linux.go` by enumerating `/dev/h
 | Serial reconnect (device unplugged/replugged) | ✓ | ✓ |
 | HID device reading | ✓ | stub (retries silently) |
 | Mic mute toggle | ✓ (WASAPI) | best-effort (pactl) |
+| Master volume / mic mute state query (for connect sync) | ✓ (WASAPI) | ✓ (pactl) |
 
 ---
 
