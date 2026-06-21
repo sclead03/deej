@@ -31,13 +31,35 @@ type sessionMap struct {
 	// were an external (e.g. Windows volume mixer) change.
 	lastMasterWriteFromDeej time.Time
 
-	masterVolumeChangeConsumers []chan float32
+	masterVolumeChangeConsumers []chan MasterVolumeUpdate
+}
+
+// MasterVolumeUpdate is delivered to SubscribeToMasterVolumeChanges subscribers.
+// ForceSync marks the periodic settle push (see masterVolumeSettleDelay) that
+// re-sends the authoritative current volume after a quiet period - subscribers
+// should apply it even if it looks like a no-op/near-duplicate of the last
+// value they pushed, since its entire purpose is correcting for a live update
+// that may have been dropped along the way.
+type MasterVolumeUpdate struct {
+	Volume    float32
+	ForceSync bool
 }
 
 // masterVolumeEchoSuppressWindow is how long after deej itself last wrote the
 // master volume that a further observed change is assumed to be an echo of
 // that same write, rather than a genuinely external change.
 const masterVolumeEchoSuppressWindow = 500 * time.Millisecond
+
+// masterVolumeSettleDelay is how long to wait after the last observed external
+// master volume change before re-pushing the authoritative current volume.
+// The live forwarding path is coalescing (latest-value-wins, see
+// masterVolumeNotifyCallback/setupMasterVolumeWatcher) to keep up with rapid
+// scrolling, which means the very last intermediate notification during a fast
+// change can occasionally be the one that gets dropped. This settle push reads
+// the true current volume directly rather than relying on whatever value made
+// it through the live path, so the final state is always correct even if a
+// live update along the way wasn't.
+const masterVolumeSettleDelay = 100 * time.Millisecond
 
 const (
 	masterSessionName = "master" // master device volume
@@ -170,28 +192,75 @@ func (m *sessionMap) setupOnSliderMove() {
 // setupMasterVolumeWatcher forwards live, externally-sourced master volume
 // changes (Windows volume mixer, media keys, another app) from the platform's
 // push-based watcher to our own subscribers, filtering out deej's own writes
-// (the SERENITY encoder) so they aren't echoed back down to the firmware.
+// (the SERENITY encoder) so they aren't echoed back down to the firmware. A
+// settle timer re-pushes the authoritative current volume masterVolumeSettleDelay
+// after the last observed change, to correct for the rare case where the live
+// (coalescing, best-effort) path above dropped the actual final value.
 func (m *sessionMap) setupMasterVolumeWatcher(watcher MasterVolumeWatcher) {
 	changes := watcher.SubscribeToMasterVolumeChanges()
 
 	go func() {
-		for vol := range changes {
-			if m.masterVolumeRecentlySetByDeej(masterVolumeEchoSuppressWindow) {
-				continue
-			}
+		settleTimer := time.NewTimer(masterVolumeSettleDelay)
+		settleTimer.Stop()
 
-			for _, consumer := range m.masterVolumeChangeConsumers {
-				consumer <- vol
+		for {
+			select {
+			case vol, ok := <-changes:
+				if !ok {
+					return
+				}
+
+				if m.masterVolumeRecentlySetByDeej(masterVolumeEchoSuppressWindow) {
+					m.logger.Debugw("Suppressed master volume change as deej's own echo", "volume", vol)
+					continue
+				}
+
+				m.logger.Debugw("Forwarding external master volume change", "volume", vol, "consumers", len(m.masterVolumeChangeConsumers))
+				m.forwardMasterVolumeChange(MasterVolumeUpdate{Volume: vol})
+
+				settleTimer.Reset(masterVolumeSettleDelay)
+
+			case <-settleTimer.C:
+				if vol, ok := m.getMasterVolume(); ok {
+					m.logger.Debugw("Settling external master volume change", "volume", vol)
+					m.forwardMasterVolumeChange(MasterVolumeUpdate{Volume: vol, ForceSync: true})
+				}
 			}
 		}
 	}()
 }
 
-// SubscribeToMasterVolumeChanges returns a channel that receives the master
-// volume scalar whenever it changes externally (not via deej's own writes).
-// Nothing is ever sent if the current platform has no MasterVolumeWatcher.
-func (m *sessionMap) SubscribeToMasterVolumeChanges() chan float32 {
-	ch := make(chan float32)
+// forwardMasterVolumeChange hands update to every subscriber registered via
+// SubscribeToMasterVolumeChanges. Each consumer channel is capacity 1 with
+// latest-value-wins semantics (same reasoning as masterVolumeNotifyCallback) -
+// a consumer that's mid-serial-write when this fires gets the freshest value
+// waiting for it, not a stale one stuck ahead of it in a queue. Note this means
+// a ForceSync update could theoretically be evicted by a live update arriving
+// a moment later before the consumer reads it - acceptable, since the live
+// update carries an equally current (or newer) volume anyway.
+func (m *sessionMap) forwardMasterVolumeChange(update MasterVolumeUpdate) {
+	for _, consumer := range m.masterVolumeChangeConsumers {
+		select {
+		case consumer <- update:
+		default:
+			select {
+			case <-consumer:
+			default:
+			}
+			select {
+			case consumer <- update:
+			default:
+			}
+		}
+	}
+}
+
+// SubscribeToMasterVolumeChanges returns a channel that receives master volume
+// updates whenever the volume changes externally (not via deej's own writes),
+// plus periodic settle corrections (see MasterVolumeUpdate.ForceSync). Nothing
+// is ever sent if the current platform has no MasterVolumeWatcher.
+func (m *sessionMap) SubscribeToMasterVolumeChanges() chan MasterVolumeUpdate {
+	ch := make(chan MasterVolumeUpdate, 1)
 	m.masterVolumeChangeConsumers = append(m.masterVolumeChangeConsumers, ch)
 	return ch
 }

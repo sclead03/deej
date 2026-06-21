@@ -13,6 +13,12 @@ const (
 	hidProductID = 0x0001
 
 	hidReconnectDelay = 2 * time.Second
+
+	// micMuteReportID is the report ID SERENITY's RGB button press sends
+	// (firmware's kMicMuteDesc, report ID 4) - distinct from the Consumer
+	// Control Play/Pause report (ID 3) the encoder double-click sends, which
+	// arrives on this same shared HID interface and must be ignored here.
+	micMuteReportID = 0x04
 )
 
 // MicMuter toggles and reports the system microphone mute state.
@@ -138,11 +144,36 @@ func (h *HIDManager) readLoop(r io.ReadCloser) {
 }
 
 func (h *HIDManager) handleReport(report []byte) {
-	// TODO: validate report bytes against the firmware HID descriptor once finalized.
-	// For now any report on this VID/PID triggers mic mute toggle.
-	h.logger.Debug("Received HID report, toggling mic mute")
+	// The Consumer Control Play/Pause report (ID 3, sent by the encoder's
+	// double-click) arrives on this same shared HID interface and must be
+	// ignored here - only the RGB button's dedicated report ID triggers mute.
+	if len(report) == 0 || report[0] != micMuteReportID {
+		h.logger.Debugw("Ignoring HID report not for mic mute", "report", report)
+		return
+	}
+
+	h.logger.Debug("Received mic-mute HID report, toggling mic mute")
 
 	if err := h.muter.ToggleMute(); err != nil {
 		h.logger.Warnw("Failed to toggle mic mute", "error", err)
+		return
 	}
+
+	muted, err := h.muter.IsMuted()
+	if err != nil {
+		h.logger.Warnw("Failed to read mic mute state after toggle", "error", err)
+		return
+	}
+
+	writer := h.deej.serial.Writer()
+	if writer == nil {
+		return
+	}
+
+	if err := writer.SendMicMuteState(muted); err != nil {
+		h.logger.Warnw("Failed to push mic mute state after toggle", "error", err)
+		return
+	}
+
+	h.logger.Debugw("Pushed mic mute state after button toggle", "muted", muted)
 }

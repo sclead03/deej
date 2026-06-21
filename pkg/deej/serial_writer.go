@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"io"
 	"sync"
+	"sync/atomic"
+	"time"
 
 	"go.uber.org/zap"
 )
@@ -30,6 +32,19 @@ type SerialWriter struct {
 	w      io.Writer
 	mu     sync.Mutex
 	logger *zap.SugaredLogger
+
+	// lastSentMasterVolumeRaw/haveSentMasterVolume/lastSentMasterVolumeAtNano
+	// record the most recent push via SendMasterVolume, so SerialIO.handleLine
+	// can recognize when an incoming "masterVol" reading is just SERENITY
+	// echoing back a value we pushed (not a real encoder move) and avoid
+	// re-deriving a SliderMoveEvent from our own echo - see handleLine in
+	// serial.go. Exact-value match alone isn't enough: a fast scroll can have
+	// multiple pushes in flight before their echoes return, so an echo of an
+	// older, already-superseded push won't match the latest value anymore -
+	// the time-window fallback (TimeSinceLastSentMasterVolume) catches that.
+	lastSentMasterVolumeRaw    atomic.Uint32
+	haveSentMasterVolume       atomic.Bool
+	lastSentMasterVolumeAtNano atomic.Int64
 }
 
 // NewSerialWriter creates a SerialWriter that writes framed commands to w.
@@ -72,7 +87,32 @@ func (sw *SerialWriter) SendChannelIcon(idx byte, bitmap []byte) error {
 func (sw *SerialWriter) SendMasterVolume(raw uint16) error {
 	payload := make([]byte, 2)
 	binary.LittleEndian.PutUint16(payload, raw)
-	return sw.send(cmdSetMasterVol, payload)
+	if err := sw.send(cmdSetMasterVol, payload); err != nil {
+		return err
+	}
+
+	sw.lastSentMasterVolumeRaw.Store(uint32(raw))
+	sw.haveSentMasterVolume.Store(true)
+	sw.lastSentMasterVolumeAtNano.Store(time.Now().UnixNano())
+	return nil
+}
+
+// TimeSinceLastSentMasterVolume returns how long ago SendMasterVolume last
+// succeeded, and whether it's ever been called at all.
+func (sw *SerialWriter) TimeSinceLastSentMasterVolume() (time.Duration, bool) {
+	if !sw.haveSentMasterVolume.Load() {
+		return 0, false
+	}
+	return time.Since(time.Unix(0, sw.lastSentMasterVolumeAtNano.Load())), true
+}
+
+// LastSentMasterVolumeRaw returns the most recent raw value successfully sent
+// via SendMasterVolume, and whether one has been sent yet at all.
+func (sw *SerialWriter) LastSentMasterVolumeRaw() (uint16, bool) {
+	if !sw.haveSentMasterVolume.Load() {
+		return 0, false
+	}
+	return uint16(sw.lastSentMasterVolumeRaw.Load()), true
 }
 
 // SendMicMuteState pushes the current system microphone mute state so SERENITY's

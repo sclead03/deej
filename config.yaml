@@ -40,7 +40,7 @@ channel_names:
 invert_sliders: false
 
 # settings for connecting to SERENITY
-com_port: COM8
+com_port: COM9
 baud_rate: 115200
 
 # adjust the amount of signal noise reduction depending on your hardware quality

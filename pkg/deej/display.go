@@ -92,8 +92,8 @@ func (dm *DisplayManager) subscribeToSerialEvents() {
 			case cmd := <-deviceCmdCh:
 				dm.handleDeviceCommand(cmd)
 
-			case vol := <-masterVolCh:
-				dm.handleExternalMasterVolumeChange(vol)
+			case update := <-masterVolCh:
+				dm.handleExternalMasterVolumeChange(update)
 			}
 		}
 	}()
@@ -104,25 +104,31 @@ func (dm *DisplayManager) subscribeToSerialEvents() {
 // keys, another app) reported by the platform's MasterVolumeWatcher. Pushes the
 // encoder itself caused are already filtered out before reaching this point -
 // see sessionMap.setupMasterVolumeWatcher.
-func (dm *DisplayManager) handleExternalMasterVolumeChange(vol float32) {
+func (dm *DisplayManager) handleExternalMasterVolumeChange(update MasterVolumeUpdate) {
 	writer := dm.deej.serial.Writer()
 	if writer == nil {
 		return
 	}
 
-	if dm.havePushedMasterVolume && !util.SignificantlyDifferent(dm.lastPushedMasterVolume, vol, dm.deej.config.NoiseReductionLevel) {
+	// ForceSync (the periodic settle correction) always sends, bypassing the
+	// noise-threshold dedup below - its entire purpose is correcting a final
+	// value the live path may have gotten slightly wrong, so a small/no-op-
+	// looking difference from the last pushed value is exactly the case it
+	// needs to still go through.
+	if !update.ForceSync && dm.havePushedMasterVolume &&
+		!util.SignificantlyDifferent(dm.lastPushedMasterVolume, update.Volume, dm.deej.config.NoiseReductionLevel) {
 		return
 	}
 
-	raw := uint16(vol*1023 + 0.5)
+	raw := uint16(update.Volume*1023 + 0.5)
 	if err := writer.SendMasterVolume(raw); err != nil {
 		dm.logger.Warnw("Failed to send live master volume update", "error", err)
 		return
 	}
 
-	dm.lastPushedMasterVolume = vol
+	dm.lastPushedMasterVolume = update.Volume
 	dm.havePushedMasterVolume = true
-	dm.logger.Debugw("Pushed live master volume update", "raw", raw)
+	dm.logger.Debugw("Pushed live master volume update", "raw", raw, "forceSync", update.ForceSync)
 }
 
 // handleDeviceCommand dispatches a binary command received from SERENITY.

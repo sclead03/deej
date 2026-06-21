@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"runtime"
 	"strings"
 	"syscall"
 	"unsafe"
@@ -24,13 +25,69 @@ var (
 	procSetupDiGetDeviceInterfaceDetail = modSetupAPI.NewProc("SetupDiGetDeviceInterfaceDetailW")
 	procSetupDiDestroyDeviceInfoList    = modSetupAPI.NewProc("SetupDiDestroyDeviceInfoList")
 	procHidDGetHidGuid                  = modHID.NewProc("HidD_GetHidGuid")
+	procHidDGetPreparsedData            = modHID.NewProc("HidD_GetPreparsedData")
+	procHidDFreePreparsedData           = modHID.NewProc("HidD_FreePreparsedData")
+	procHidPGetCaps                     = modHID.NewProc("HidP_GetCaps")
 )
 
 const (
 	digcfPresent         = 0x00000002
 	digcfDeviceInterface = 0x00000010
 	invalidHandleValue   = ^uintptr(0)
+
+	hidpStatusSuccess = 0x00110000
+
+	// micMuteUsagePage/micMuteUsage identify the RGB button's dedicated
+	// top-level collection (firmware's kMicMuteDesc in main.cpp) - SERENITY's
+	// composite HID interface also exposes a separate Consumer Control
+	// collection (Play/Pause) on the same VID/PID, as its own top-level
+	// collection (Windows splits each into its own device path, e.g.
+	// HID\VID_xxxx&PID_xxxx&MI_02&COL01 vs &COL02). Matching on VID/PID alone
+	// picks whichever collection enumerates first, which silently grabbed the
+	// wrong one once a second collection existed - must check actual usage.
+	micMuteUsagePage = 0xFF00
+	micMuteUsage     = 0x01
 )
+
+// hidpCaps mirrors the fixed-size HIDP_CAPS struct (hidpi.h) - must be the
+// exact real size (62 bytes) since HidP_GetCaps writes into it directly;
+// only Usage/UsagePage are actually read here.
+type hidpCaps struct {
+	Usage                     uint16
+	UsagePage                 uint16
+	InputReportByteLength     uint16
+	OutputReportByteLength    uint16
+	FeatureReportByteLength   uint16
+	Reserved                  [17]uint16
+	NumberLinkCollectionNodes uint16
+	NumberInputButtonCaps     uint16
+	NumberInputValueCaps      uint16
+	NumberInputDataIndices    uint16
+	NumberOutputButtonCaps    uint16
+	NumberOutputValueCaps     uint16
+	NumberOutputDataIndices   uint16
+	NumberFeatureButtonCaps   uint16
+	NumberFeatureValueCaps    uint16
+	NumberFeatureDataIndices  uint16
+}
+
+// matchesMicMuteCollection reports whether the opened HID handle is the RGB
+// button's vendor-defined top-level collection (vs. e.g. the Consumer Control
+// one sharing the same VID/PID).
+func matchesMicMuteCollection(handle windows.Handle) bool {
+	var preparsedData uintptr
+
+	ret, _, _ := procHidDGetPreparsedData.Call(uintptr(handle), uintptr(unsafe.Pointer(&preparsedData)))
+	if ret == 0 {
+		return false
+	}
+	defer procHidDFreePreparsedData.Call(preparsedData)
+
+	var caps hidpCaps
+	status, _, _ := procHidPGetCaps.Call(preparsedData, uintptr(unsafe.Pointer(&caps)))
+
+	return status == hidpStatusSuccess && caps.UsagePage == micMuteUsagePage && caps.Usage == micMuteUsage
+}
 
 type hidGUID struct {
 	Data1 uint32
@@ -130,7 +187,15 @@ func openSERENITY() (io.ReadCloser, error) {
 				0,
 			)
 			if err != nil {
-				return nil, fmt.Errorf("open HID device: %w", err)
+				// this VID/PID can have multiple top-level collections (e.g. the
+				// Consumer Control one) - a share violation on one candidate
+				// shouldn't abort the search for the right one.
+				continue
+			}
+
+			if !matchesMicMuteCollection(handle) {
+				windows.CloseHandle(handle)
+				continue
 			}
 
 			return &winHIDHandle{handle: handle}, nil
@@ -165,7 +230,19 @@ func newMicMuter(logger *zap.SugaredLogger) (MicMuter, error) {
 
 // withCaptureVolume initializes COM and the default capture endpoint's
 // IAudioEndpointVolume, then hands it to fn for the duration of the call.
+// Pins this goroutine to its current OS thread for the duration of the call -
+// these are hand-rolled syscall-based COM bindings (go-wca), and letting the Go
+// scheduler migrate this goroutine to a different OS thread mid-call-chain (it's
+// never otherwise pinned - this runs on HIDManager's read-loop goroutine) was
+// observed to corrupt the Go heap (runtime "fatal error: fault", not a normal
+// panic) rather than cleanly erroring. Unlocked again before returning since
+// nothing here needs to outlive the call (contrast with the master-volume
+// watcher's registration in session_finder_windows.go, which is deliberately
+// never unlocked because it must persist).
 func (m *windowsMicMuter) withCaptureVolume(fn func(aev *wca.IAudioEndpointVolume) error) error {
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+
 	if err := ole.CoInitializeEx(0, ole.COINIT_APARTMENTTHREADED); err != nil {
 		const eFalse = 1
 		oleError := &ole.OleError{}
@@ -204,7 +281,14 @@ func (m *windowsMicMuter) withCaptureVolume(fn func(aev *wca.IAudioEndpointVolum
 }
 
 func (m *windowsMicMuter) ToggleMute() error {
-	return m.withCaptureVolume(func(aev *wca.IAudioEndpointVolume) error {
+	// Deliberately doesn't touch m (the receiver) from inside the closure -
+	// only aev and a plain local. The crash reproduced here consistently
+	// pointed at m.logger.Debugw called from inside this closure immediately
+	// after the COM calls returned; IsMuted's closure (which never touches m)
+	// never crashed. Logging after withCaptureVolume returns instead, fully
+	// outside the COM/syscall call chain, avoids whatever that interaction is.
+	var nowMuted bool
+	err := m.withCaptureVolume(func(aev *wca.IAudioEndpointVolume) error {
 		var muted bool
 		if err := aev.GetMute(&muted); err != nil {
 			return fmt.Errorf("get mute state: %w", err)
@@ -214,9 +298,15 @@ func (m *windowsMicMuter) ToggleMute() error {
 			return fmt.Errorf("set mute state: %w", err)
 		}
 
-		m.logger.Debugw("Toggled mic mute", "nowMuted", !muted)
+		nowMuted = !muted
 		return nil
 	})
+	if err != nil {
+		return err
+	}
+
+	m.logger.Debugw("Toggled mic mute", "nowMuted", nowMuted)
+	return nil
 }
 
 // IsMuted reports the current system microphone mute state.

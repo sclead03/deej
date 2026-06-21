@@ -64,6 +64,15 @@ type inboundMessage struct {
 
 var expectedLinePattern = regexp.MustCompile(`^\d{1,4}(\|\d{1,4})*\r\n$`)
 
+// masterVolumeSerialEchoWindow is how long after a SET_MASTER_VOLUME push to
+// recognize any slot-0 ("master") reading as a likely echo of that push,
+// rather than a real encoder move - see the isMasterVolumeEcho check in
+// handleLine. Comfortably larger than the worst-case round trip (firmware's
+// own 16ms/60Hz send-rate cap plus loop/processing time, typically well under
+// 50ms) while still short enough not to meaningfully delay real encoder input
+// shortly after a host-driven change stops.
+const masterVolumeSerialEchoWindow = 200 * time.Millisecond
+
 // NewSerialIO creates a SerialIO instance that uses the provided deej
 // instance's connection info to establish communications with SERENITY
 func NewSerialIO(deej *Deej, logger *zap.SugaredLogger) (*SerialIO, error) {
@@ -428,10 +437,37 @@ func (sio *SerialIO) handleLine(logger *zap.SugaredLogger, line string) {
 			// baseline silently here and let the encoder/pushMasterState drive it from now on.
 			primingMasterSlider := sliderIdx == 0 && sio.currentSliderPercentValues[sliderIdx] < 0
 
+			// slider 0 is also a live-volume push target (SET_MASTER_VOLUME) - SERENITY
+			// echoes its current masterVol back on every regular line, so a value we
+			// just pushed comes right back here looking like a fresh encoder move. If
+			// untreated, re-deriving a SliderMoveEvent from our own echo re-applies a
+			// (lossy, truncated) round-trip of a value Windows already has, and re-arms
+			// masterVolumeRecentlySetByDeej's suppression window on every cycle - which
+			// starves genuinely external volume changes arriving during continuous
+			// scrolling, since the window never gets a chance to actually expire.
+			//
+			// Exact match against the latest sent value isn't sufficient on its own: a
+			// fast scroll can have several pushes in flight before their echoes return
+			// (each round trip takes a firmware loop iteration plus its own send-rate
+			// cap), so an echo of an older, already-superseded push won't match the
+			// *latest* sent value anymore. Misreading that as a fresh encoder move
+			// reapplies a stale, higher-than-current (or lower, if scrolling up) value
+			// to Windows - the audible/visible "bounce backwards" during fast scrolling.
+			// The time-window fallback catches every in-flight echo regardless of how
+			// many pushes are queued ahead of it.
+			isMasterVolumeEcho := false
+			if sliderIdx == 0 && sio.writer != nil {
+				if lastSent, ok := sio.writer.LastSentMasterVolumeRaw(); ok && uint16(number) == lastSent {
+					isMasterVolumeEcho = true
+				} else if sinceSend, ok := sio.writer.TimeSinceLastSentMasterVolume(); ok && sinceSend < masterVolumeSerialEchoWindow {
+					isMasterVolumeEcho = true
+				}
+			}
+
 			// if it does, update the saved value and create a move event
 			sio.currentSliderPercentValues[sliderIdx] = normalizedScalar
 
-			if !primingMasterSlider {
+			if !primingMasterSlider && !isMasterVolumeEcho {
 				moveEvents = append(moveEvents, SliderMoveEvent{
 					SliderID:     sliderIdx,
 					PercentValue: normalizedScalar,

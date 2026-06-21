@@ -3,6 +3,7 @@ package deej
 import (
 	"errors"
 	"fmt"
+	"runtime"
 	"strings"
 	"syscall"
 	"time"
@@ -30,7 +31,11 @@ type wcaSessionFinder struct {
 
 	// pushes live master output volume changes (see MasterVolumeWatcher);
 	// aevCallback is built once and re-registered against each new masterOut's
-	// IAudioEndpointVolume as it's (re)created in GetAllSessions
+	// IAudioEndpointVolume as it's (re)created in GetAllSessions.
+	// Capacity 1, latest-value-wins (see masterVolumeNotifyCallback) - a fast
+	// volume scroll fires far more notifications than the serial link can drain,
+	// so this is intentionally a coalescing slot, not a queue: an unconsumed
+	// stale value gets overwritten rather than blocking out the newest one.
 	masterVolumeChanges chan float32
 	aevCallback         *iAudioEndpointVolumeCallback
 }
@@ -53,7 +58,7 @@ func newSessionFinder(logger *zap.SugaredLogger) (SessionFinder, error) {
 		logger:              logger.Named("session_finder"),
 		sessionLogger:       logger.Named("sessions"),
 		eventCtx:            ole.NewGUID(myteriousGUID),
-		masterVolumeChanges: make(chan float32, 8),
+		masterVolumeChanges: make(chan float32, 1),
 	}
 
 	sf.logger.Debug("Created WCA session finder instance")
@@ -68,6 +73,15 @@ func (sf *wcaSessionFinder) SubscribeToMasterVolumeChanges() <-chan float32 {
 
 func (sf *wcaSessionFinder) GetAllSessions() ([]Session, error) {
 	sessions := []Session{}
+
+	// Pin this goroutine to its current OS thread before touching COM. This
+	// function registers long-lived notification sinks (default device change,
+	// master volume change) against the STA apartment created below; if the
+	// calling goroutine were later rescheduled onto a different OS thread by the
+	// Go scheduler, the apartment those sinks belong to would be orphaned.
+	// LockOSThread is cheap to call repeatedly (refcounted per goroutine) and is
+	// never unlocked here by design - see the CoUninitialize comment below.
+	runtime.LockOSThread()
 
 	// we must call this every time we're about to list devices, i think. could be wrong
 	if err := ole.CoInitializeEx(0, ole.COINIT_APARTMENTTHREADED); err != nil {
@@ -99,7 +113,18 @@ func (sf *wcaSessionFinder) GetAllSessions() ([]Session, error) {
 		}
 
 	}
-	defer ole.CoUninitialize()
+
+	// Deliberately not calling ole.CoUninitialize() here (it used to be deferred).
+	// This was the actual bug behind master volume live-tracking never firing:
+	// registerDefaultDeviceChangeCallback/registerMasterVolumeChangeCallback below
+	// register notification sinks against the apartment just created on this
+	// thread, then the deferred CoUninitialize tore that same apartment down the
+	// instant this function returned - before the audio engine ever got a chance
+	// to dispatch a callback into it. The registrations are meant to live for the
+	// life of the process, so the apartment needs to outlive this function call.
+	// Letting COM stay initialized on this (now permanently locked, see above)
+	// thread until process exit is the standard pattern for a long-running
+	// service and costs nothing meaningful here.
 
 	// ensure we have a device enumerator
 	if err := sf.getDeviceEnumerator(); err != nil {
@@ -622,6 +647,8 @@ func (sf *wcaSessionFinder) registerMasterVolumeChangeCallback() error {
 		return ole.NewError(hr)
 	}
 
+	sf.logger.Debug("Registered master volume change callback")
+
 	return nil
 }
 
@@ -642,6 +669,11 @@ func (sf *wcaSessionFinder) masterVolumeNotifyCallback(this uintptr, pNotify *au
 		return
 	}
 
+	sf.logger.Debugw("Master volume notify callback fired",
+		"volume", pNotify.FMasterVolume,
+		"muted", pNotify.BMuted != 0,
+		"isOwnWrite", pNotify.GuidEventContext == *sf.eventCtx)
+
 	// deej's own writes (currently: only the SERENITY encoder, via SetVolume with
 	// this exact context) are filtered here precisely; sessionMap also applies a
 	// time-window filter as a platform-agnostic backstop for watchers that can't
@@ -650,10 +682,22 @@ func (sf *wcaSessionFinder) masterVolumeNotifyCallback(this uintptr, pNotify *au
 		return
 	}
 
+	// Latest-value-wins: if the consumer hasn't drained the previous value yet,
+	// evict it and replace it with this one instead of dropping this one. A
+	// fast volume change fires many more of these than the serial link can
+	// drain; we'd rather the consumer eventually see the final settled value
+	// than get stuck behind a queue of stale intermediate ones.
 	select {
 	case sf.masterVolumeChanges <- pNotify.FMasterVolume:
 	default:
-		sf.logger.Debug("Dropped master volume change notification, consumer not keeping up")
+		select {
+		case <-sf.masterVolumeChanges:
+		default:
+		}
+		select {
+		case sf.masterVolumeChanges <- pNotify.FMasterVolume:
+		default:
+		}
 	}
 
 	return
