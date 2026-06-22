@@ -287,6 +287,19 @@ func (m *windowsMicMuter) ToggleMute() error {
 	// after the COM calls returned; IsMuted's closure (which never touches m)
 	// never crashed. Logging after withCaptureVolume returns instead, fully
 	// outside the COM/syscall call chain, avoids whatever that interaction is.
+	//
+	// SetMute's eventContext arg is deliberately always nil here (never a real
+	// *ole.GUID) - passing a real one, even captured as a plain local before
+	// the closure, reproduced a hard access violation crash inside the
+	// aevSetMute syscall itself every time (confirmed via a console build's
+	// crash trace, pointing straight at iaudioendpointvolume_windows.go's
+	// SetMute syscall). withCaptureVolume's per-call CoInitializeEx/LockOSThread
+	// cycle makes this whole call chain fragile in ways not fully understood
+	// (see the closure-receiver crash above, a different but related issue) -
+	// don't add a non-nil pointer argument to this specific syscall again.
+	// Self-triggered mute changes are instead recognized by sessionMap via a
+	// time-window check (markMicMuteSetByButton), not a GUID, applied entirely
+	// in plain Go code with no COM/syscall involvement.
 	var nowMuted bool
 	err := m.withCaptureVolume(func(aev *wca.IAudioEndpointVolume) error {
 		var muted bool

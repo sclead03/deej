@@ -15,8 +15,8 @@ type paSessionFinder struct {
 	client *proto.Client
 	conn   net.Conn
 
-	// pushes live master sink volume changes (see MasterVolumeWatcher)
-	masterVolumeChanges chan float32
+	// pushes live master sink volume/mute changes (see MasterVolumeWatcher)
+	masterVolumeChanges chan MasterVolumeNotification
 }
 
 // PulseAudio native protocol subscription mask/event bits (pulse/def.h). The
@@ -55,7 +55,7 @@ func newSessionFinder(logger *zap.SugaredLogger) (SessionFinder, error) {
 		sessionLogger:       logger.Named("sessions"),
 		client:              client,
 		conn:                conn,
-		masterVolumeChanges: make(chan float32, 8),
+		masterVolumeChanges: make(chan MasterVolumeNotification, 8),
 	}
 
 	// live-track external changes to the master sink volume (another app,
@@ -72,7 +72,7 @@ func newSessionFinder(logger *zap.SugaredLogger) (SessionFinder, error) {
 }
 
 // SubscribeToMasterVolumeChanges implements MasterVolumeWatcher.
-func (sf *paSessionFinder) SubscribeToMasterVolumeChanges() <-chan float32 {
+func (sf *paSessionFinder) SubscribeToMasterVolumeChanges() <-chan MasterVolumeNotification {
 	return sf.masterVolumeChanges
 }
 
@@ -111,9 +111,10 @@ func (sf *paSessionFinder) forwardMasterSinkVolume() {
 	}
 
 	vol := parseChannelVolumes(reply.ChannelVolumes)
+	notification := MasterVolumeNotification{Volume: vol, Muted: reply.Mute}
 
 	select {
-	case sf.masterVolumeChanges <- vol:
+	case sf.masterVolumeChanges <- notification:
 	default:
 		sf.logger.Debug("Dropped master volume change notification, consumer not keeping up")
 	}

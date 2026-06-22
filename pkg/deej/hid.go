@@ -154,6 +154,17 @@ func (h *HIDManager) handleReport(report []byte) {
 
 	h.logger.Debug("Received mic-mute HID report, toggling mic mute")
 
+	// Marked *before* ToggleMute, not after: SetMute's registered notification
+	// callback can fire synchronously, on this same call stack, before
+	// ToggleMute even returns - marking afterward left a race where the live
+	// watcher's suppression check (sessionMap.micMuteRecentlySetByButton) could
+	// run before this mark was recorded, occasionally letting our own write
+	// through as if it were external (harmless here since both pushes agreed
+	// on the same value, but not the intended single clean push). See
+	// session_map.go's micMuteRecentlySetByButton for why this is a plain time
+	// window instead of a COM eventContext GUID.
+	h.deej.sessions.markMicMuteSetByButton()
+
 	if err := h.muter.ToggleMute(); err != nil {
 		h.logger.Warnw("Failed to toggle mic mute", "error", err)
 		return

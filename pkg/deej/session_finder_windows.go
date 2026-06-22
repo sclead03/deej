@@ -29,15 +29,24 @@ type wcaSessionFinder struct {
 	masterOut *masterSession
 	masterIn  *masterSession
 
-	// pushes live master output volume changes (see MasterVolumeWatcher);
+	// pushes live master output volume/mute changes (see MasterVolumeWatcher);
 	// aevCallback is built once and re-registered against each new masterOut's
 	// IAudioEndpointVolume as it's (re)created in GetAllSessions.
 	// Capacity 1, latest-value-wins (see masterVolumeNotifyCallback) - a fast
 	// volume scroll fires far more notifications than the serial link can drain,
 	// so this is intentionally a coalescing slot, not a queue: an unconsumed
 	// stale value gets overwritten rather than blocking out the newest one.
-	masterVolumeChanges chan float32
+	masterVolumeChanges chan MasterVolumeNotification
 	aevCallback         *iAudioEndpointVolumeCallback
+
+	// pushes live mic (default capture device) mute changes (see MicMuteWatcher);
+	// micMuteCallback is registered against masterIn's IAudioEndpointVolume the
+	// same way aevCallback is registered against masterOut's. Capacity 1, same
+	// latest-value-wins reasoning as masterVolumeChanges, though in practice a
+	// mute toggle is a discrete event with no flooding concern - kept consistent
+	// with the volume watcher rather than for any pressing functional need.
+	micMuteChanges chan bool
+	micMuteCallback *iAudioEndpointVolumeCallback
 }
 
 const (
@@ -58,7 +67,8 @@ func newSessionFinder(logger *zap.SugaredLogger) (SessionFinder, error) {
 		logger:              logger.Named("session_finder"),
 		sessionLogger:       logger.Named("sessions"),
 		eventCtx:            ole.NewGUID(myteriousGUID),
-		masterVolumeChanges: make(chan float32, 1),
+		masterVolumeChanges: make(chan MasterVolumeNotification, 1),
+		micMuteChanges:      make(chan bool, 1),
 	}
 
 	sf.logger.Debug("Created WCA session finder instance")
@@ -67,8 +77,13 @@ func newSessionFinder(logger *zap.SugaredLogger) (SessionFinder, error) {
 }
 
 // SubscribeToMasterVolumeChanges implements MasterVolumeWatcher.
-func (sf *wcaSessionFinder) SubscribeToMasterVolumeChanges() <-chan float32 {
+func (sf *wcaSessionFinder) SubscribeToMasterVolumeChanges() <-chan MasterVolumeNotification {
 	return sf.masterVolumeChanges
+}
+
+// SubscribeToMicMuteChanges implements MicMuteWatcher.
+func (sf *wcaSessionFinder) SubscribeToMicMuteChanges() <-chan bool {
+	return sf.micMuteChanges
 }
 
 func (sf *wcaSessionFinder) GetAllSessions() ([]Session, error) {
@@ -179,6 +194,15 @@ func (sf *wcaSessionFinder) GetAllSessions() ([]Session, error) {
 		}
 
 		sessions = append(sessions, sf.masterIn)
+
+		// live-track external changes to the mic mute state (Windows mic
+		// settings/taskbar, another app) - not changes via SERENITY's RGB
+		// button, which already round-trips through HIDManager directly and
+		// is filtered out here by GUID (see micMuteNotifyCallback). Best-effort,
+		// same reasoning as registerMasterVolumeChangeCallback above.
+		if err := sf.registerMicMuteChangeCallback(); err != nil {
+			sf.logger.Warnw("Failed to register mic mute change callback", "error", err)
+		}
 	}
 
 	// enumerate all devices and make their "master" sessions bindable by friendly name;
@@ -682,23 +706,113 @@ func (sf *wcaSessionFinder) masterVolumeNotifyCallback(this uintptr, pNotify *au
 		return
 	}
 
+	notification := MasterVolumeNotification{
+		Volume: pNotify.FMasterVolume,
+		Muted:  pNotify.BMuted != 0,
+	}
+
 	// Latest-value-wins: if the consumer hasn't drained the previous value yet,
 	// evict it and replace it with this one instead of dropping this one. A
 	// fast volume change fires many more of these than the serial link can
 	// drain; we'd rather the consumer eventually see the final settled value
 	// than get stuck behind a queue of stale intermediate ones.
 	select {
-	case sf.masterVolumeChanges <- pNotify.FMasterVolume:
+	case sf.masterVolumeChanges <- notification:
 	default:
 		select {
 		case <-sf.masterVolumeChanges:
 		default:
 		}
 		select {
-		case sf.masterVolumeChanges <- pNotify.FMasterVolume:
+		case sf.masterVolumeChanges <- notification:
 		default:
 		}
 	}
 
 	return
+}
+
+// registerMicMuteChangeCallback (re)registers our IAudioEndpointVolumeCallback
+// against the current sf.masterIn's IAudioEndpointVolume - same pattern as
+// registerMasterVolumeChangeCallback above, just targeting the capture endpoint
+// and a separate callback object (OnNotify needs to dispatch to micMuteNotifyCallback
+// instead of masterVolumeNotifyCallback).
+func (sf *wcaSessionFinder) registerMicMuteChangeCallback() error {
+	if sf.masterIn == nil {
+		return errors.New("no master input session to register against")
+	}
+
+	if sf.micMuteCallback == nil {
+		sf.micMuteCallback = &iAudioEndpointVolumeCallback{
+			VTable: &iAudioEndpointVolumeCallbackVtbl{
+				QueryInterface: syscall.NewCallback(sf.noopCallback),
+				AddRef:         syscall.NewCallback(sf.noopCallback),
+				Release:        syscall.NewCallback(sf.noopCallback),
+				OnNotify:       syscall.NewCallback(sf.micMuteNotifyCallback),
+			},
+		}
+	}
+
+	aev := sf.masterIn.volume
+
+	hr, _, _ := syscall.Syscall(
+		aev.VTable().RegisterControlChangeNotify,
+		2,
+		uintptr(unsafe.Pointer(aev)),
+		uintptr(unsafe.Pointer(sf.micMuteCallback)),
+		0)
+	if hr != 0 {
+		return ole.NewError(hr)
+	}
+
+	sf.logger.Debug("Registered mic mute change callback")
+
+	return nil
+}
+
+// micMuteNotifyCallback is invoked by the Windows audio engine whenever the
+// default capture endpoint's volume or mute state changes - including
+// synchronously, on the calling thread, when that change was caused by a
+// SetMute call on the very same endpoint (windowsMicMuter.ToggleMute, from
+// inside withCaptureVolume's runtime.LockOSThread()-pinned closure - the same
+// fragile context already responsible for two prior crashes in this codebase,
+// see project-deejx-mic-mute-hid memory). To keep this call's surface minimal
+// regardless, it does nothing but copy the notification by value and hand off
+// to a goroutine - the real logic happens there, fully decoupled from
+// whatever syscall stack triggered it.
+//
+// Unlike masterVolumeNotifyCallback, this has no GUID-based own-write filter:
+// ToggleMute's SetMute call always passes a nil eventContext (passing a real
+// *ole.GUID through that specific syscall reproduced a hard access violation
+// crash every time, root cause not fully understood - see ToggleMute's
+// comment in hid_windows.go). Self-triggered changes are filtered downstream
+// instead, by sessionMap's micMuteRecentlySetByButton time-window check.
+func (sf *wcaSessionFinder) micMuteNotifyCallback(this uintptr, pNotify *audioVolumeNotificationData) (hResult uintptr) {
+	if pNotify == nil {
+		return
+	}
+
+	notification := *pNotify
+	go sf.handleMicMuteNotification(notification)
+
+	return
+}
+
+func (sf *wcaSessionFinder) handleMicMuteNotification(pNotify audioVolumeNotificationData) {
+	sf.logger.Debugw("Mic mute notify callback fired", "muted", pNotify.BMuted != 0)
+
+	muted := pNotify.BMuted != 0
+
+	select {
+	case sf.micMuteChanges <- muted:
+	default:
+		select {
+		case <-sf.micMuteChanges:
+		default:
+		}
+		select {
+		case sf.micMuteChanges <- muted:
+		default:
+		}
+	}
 }

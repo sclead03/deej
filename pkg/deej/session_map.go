@@ -31,7 +31,17 @@ type sessionMap struct {
 	// were an external (e.g. Windows volume mixer) change.
 	lastMasterWriteFromDeej time.Time
 
+	// lastMicMuteWriteFromButton records when SERENITY's RGB button last
+	// triggered a mic mute toggle (HIDManager.handleReport). Used the same way
+	// as lastMasterWriteFromDeej, but via a plain time window instead of a COM
+	// eventContext GUID - tagging windowsMicMuter's SetMute call with a real
+	// GUID reproduced a hard crash inside that specific syscall (see
+	// hid_windows.go's ToggleMute), so this filtering happens here instead,
+	// entirely in plain Go with no COM/syscall involvement.
+	lastMicMuteWriteFromButton time.Time
+
 	masterVolumeChangeConsumers []chan MasterVolumeUpdate
+	micMuteChangeConsumers      []chan bool
 }
 
 // MasterVolumeUpdate is delivered to SubscribeToMasterVolumeChanges subscribers.
@@ -39,9 +49,12 @@ type sessionMap struct {
 // re-sends the authoritative current volume after a quiet period - subscribers
 // should apply it even if it looks like a no-op/near-duplicate of the last
 // value they pushed, since its entire purpose is correcting for a live update
-// that may have been dropped along the way.
+// that may have been dropped along the way. Muted carries the master output's
+// real WASAPI mute state alongside the volume, since the underlying OS
+// notification always reports them together (see MasterVolumeNotification).
 type MasterVolumeUpdate struct {
 	Volume    float32
+	Muted     bool
 	ForceSync bool
 }
 
@@ -60,6 +73,12 @@ const masterVolumeEchoSuppressWindow = 500 * time.Millisecond
 // it through the live path, so the final state is always correct even if a
 // live update along the way wasn't.
 const masterVolumeSettleDelay = 100 * time.Millisecond
+
+// micMuteEchoSuppressWindow is how long after SERENITY's RGB button last
+// triggered a mic mute toggle that a further observed change is assumed to be
+// an echo of that same write, rather than a genuinely external change. Same
+// reasoning and magnitude as masterVolumeEchoSuppressWindow.
+const micMuteEchoSuppressWindow = 500 * time.Millisecond
 
 const (
 	masterSessionName = "master" // master device volume
@@ -120,6 +139,10 @@ func (m *sessionMap) initialize() error {
 
 	if watcher, ok := m.sessionFinder.(MasterVolumeWatcher); ok {
 		m.setupMasterVolumeWatcher(watcher)
+	}
+
+	if watcher, ok := m.sessionFinder.(MicMuteWatcher); ok {
+		m.setupMicMuteWatcher(watcher)
 	}
 
 	return nil
@@ -203,31 +226,92 @@ func (m *sessionMap) setupMasterVolumeWatcher(watcher MasterVolumeWatcher) {
 		settleTimer := time.NewTimer(masterVolumeSettleDelay)
 		settleTimer.Stop()
 
+		// lastMuted tracks the most recently observed mute state, for use by the
+		// settle/ForceSync branch below - mute is a discrete flag with no
+		// jitter/precision-loss concern the way the live volume path has, so
+		// there's no need to re-derive it the way getMasterVolume() re-derives
+		// volume; the last live observation is already authoritative.
+		var lastMuted bool
+
 		for {
 			select {
-			case vol, ok := <-changes:
+			case notification, ok := <-changes:
 				if !ok {
 					return
 				}
 
 				if m.masterVolumeRecentlySetByDeej(masterVolumeEchoSuppressWindow) {
-					m.logger.Debugw("Suppressed master volume change as deej's own echo", "volume", vol)
+					m.logger.Debugw("Suppressed master volume change as deej's own echo", "notification", notification)
 					continue
 				}
 
-				m.logger.Debugw("Forwarding external master volume change", "volume", vol, "consumers", len(m.masterVolumeChangeConsumers))
-				m.forwardMasterVolumeChange(MasterVolumeUpdate{Volume: vol})
+				lastMuted = notification.Muted
+
+				m.logger.Debugw("Forwarding external master volume change", "notification", notification, "consumers", len(m.masterVolumeChangeConsumers))
+				m.forwardMasterVolumeChange(MasterVolumeUpdate{Volume: notification.Volume, Muted: notification.Muted})
 
 				settleTimer.Reset(masterVolumeSettleDelay)
 
 			case <-settleTimer.C:
 				if vol, ok := m.getMasterVolume(); ok {
-					m.logger.Debugw("Settling external master volume change", "volume", vol)
-					m.forwardMasterVolumeChange(MasterVolumeUpdate{Volume: vol, ForceSync: true})
+					m.logger.Debugw("Settling external master volume change", "volume", vol, "muted", lastMuted)
+					m.forwardMasterVolumeChange(MasterVolumeUpdate{Volume: vol, Muted: lastMuted, ForceSync: true})
 				}
 			}
 		}
 	}()
+}
+
+// setupMicMuteWatcher forwards live, externally-sourced mic mute changes
+// (Windows mic settings/taskbar, another app) from the platform's push-based
+// watcher to our own subscribers. Unlike master volume, no echo-suppression
+// window is needed here: changes caused by SERENITY's own RGB button are
+// already filtered out at the platform layer by GUID (see
+// wcaSessionFinder.micMuteNotifyCallback), since deej never writes mic mute
+// any other way.
+func (m *sessionMap) setupMicMuteWatcher(watcher MicMuteWatcher) {
+	changes := watcher.SubscribeToMicMuteChanges()
+
+	go func() {
+		for muted := range changes {
+			if m.micMuteRecentlySetByButton(micMuteEchoSuppressWindow) {
+				m.logger.Debugw("Suppressed mic mute change as RGB button's own echo", "muted", muted)
+				continue
+			}
+
+			m.logger.Debugw("Forwarding external mic mute change", "muted", muted, "consumers", len(m.micMuteChangeConsumers))
+			m.forwardMicMuteChange(muted)
+		}
+	}()
+}
+
+// forwardMicMuteChange hands muted to every subscriber registered via
+// SubscribeToMicMuteChanges, with the same latest-value-wins coalescing
+// reasoning as forwardMasterVolumeChange.
+func (m *sessionMap) forwardMicMuteChange(muted bool) {
+	for _, consumer := range m.micMuteChangeConsumers {
+		select {
+		case consumer <- muted:
+		default:
+			select {
+			case <-consumer:
+			default:
+			}
+			select {
+			case consumer <- muted:
+			default:
+			}
+		}
+	}
+}
+
+// SubscribeToMicMuteChanges returns a channel that receives mic mute updates
+// whenever the mute state changes externally (not via SERENITY's RGB button).
+// Nothing is ever sent if the current platform has no MicMuteWatcher.
+func (m *sessionMap) SubscribeToMicMuteChanges() chan bool {
+	ch := make(chan bool, 1)
+	m.micMuteChangeConsumers = append(m.micMuteChangeConsumers, ch)
+	return ch
 }
 
 // forwardMasterVolumeChange hands update to every subscriber registered via
@@ -474,6 +558,34 @@ func (m *sessionMap) getMasterVolume() (float32, bool) {
 	return sessions[0].GetVolume(), true
 }
 
+// getMasterMuted returns the master output session's current real WASAPI mute
+// state, or false/false if the master session isn't available or doesn't
+// support mute queries (e.g. the Linux master session, which has no GetMuted
+// method - per-platform mute support is optional, mirroring how
+// MasterVolumeWatcher/MicMuteWatcher are optional session finder interfaces).
+func (m *sessionMap) getMasterMuted() (bool, bool) {
+	sessions, ok := m.get(masterSessionName)
+	if !ok || len(sessions) == 0 {
+		return false, false
+	}
+
+	type muteGetter interface {
+		GetMuted() (bool, error)
+	}
+
+	mg, ok := sessions[0].(muteGetter)
+	if !ok {
+		return false, false
+	}
+
+	muted, err := mg.GetMuted()
+	if err != nil {
+		return false, false
+	}
+
+	return muted, true
+}
+
 // markMasterVolumeSetByDeej records that deej itself just wrote the master
 // session's volume (see lastMasterWriteFromDeej).
 func (m *sessionMap) markMasterVolumeSetByDeej() {
@@ -490,6 +602,24 @@ func (m *sessionMap) masterVolumeRecentlySetByDeej(window time.Duration) bool {
 	defer m.lock.Unlock()
 
 	return time.Since(m.lastMasterWriteFromDeej) < window
+}
+
+// markMicMuteSetByButton records that SERENITY's RGB button just triggered a
+// mic mute toggle (see lastMicMuteWriteFromButton).
+func (m *sessionMap) markMicMuteSetByButton() {
+	m.lock.Lock()
+	defer m.lock.Unlock()
+
+	m.lastMicMuteWriteFromButton = time.Now()
+}
+
+// micMuteRecentlySetByButton reports whether SERENITY's RGB button triggered
+// a mic mute toggle within the given window.
+func (m *sessionMap) micMuteRecentlySetByButton(window time.Duration) bool {
+	m.lock.Lock()
+	defer m.lock.Unlock()
+
+	return time.Since(m.lastMicMuteWriteFromButton) < window
 }
 
 func (m *sessionMap) clear() {

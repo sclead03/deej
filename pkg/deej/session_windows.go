@@ -183,6 +183,20 @@ func (s *masterSession) SetVolume(v float32) error {
 	return nil
 }
 
+// GetMuted reports the master output session's real WASAPI mute state
+// (BMuted) - distinct from SERENITY's own local zero-spoof "volMuted" concept,
+// which has no host-side representation of its own (see pushMasterState).
+// Used via the optional muteGetter interface in sessionMap.getMasterMuted.
+func (s *masterSession) GetMuted() (bool, error) {
+	var muted bool
+	if err := s.volume.GetMute(&muted); err != nil {
+		s.logger.Warnw("Failed to get session mute state", "error", err)
+		return false, fmt.Errorf("get session mute state: %w", err)
+	}
+
+	return muted, nil
+}
+
 func (s *masterSession) Release() {
 	s.logger.Debug("Releasing audio session")
 

@@ -20,6 +20,7 @@ const (
 	cmdSetChIcon       = byte(0x03)
 	cmdSetMasterVol    = byte(0x04)
 	cmdSetMicMuteState = byte(0x05)
+	cmdSetMasterMute   = byte(0x07) // 0x06 is reserved device->host (CMD_REQUEST_ICON_REDRAW, see display.go)
 
 	// MaxChannelNameLength is the maximum number of characters in a channel display
 	// name (excluding the null terminator). Revisit when firmware font size is finalized.
@@ -123,6 +124,18 @@ func (sw *SerialWriter) SendMicMuteState(muted bool) error {
 		payload[0] = 0x01
 	}
 	return sw.send(cmdSetMicMuteState, payload)
+}
+
+// SendMasterMuteState pushes the master output's real WASAPI mute state
+// (Windows volume mixer mute button, media key mute, etc.) - distinct from the
+// SERENITY encoder's own local single-click mute, which never needs this command
+// since it already round-trips correctly via the existing fader/ASCII channel.
+func (sw *SerialWriter) SendMasterMuteState(muted bool) error {
+	payload := []byte{0x00}
+	if muted {
+		payload[0] = 0x01
+	}
+	return sw.send(cmdSetMasterMute, payload)
 }
 
 func (sw *SerialWriter) send(cmdID byte, payload []byte) error {

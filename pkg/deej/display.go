@@ -31,6 +31,11 @@ type DisplayManager struct {
 	// redundant pushes triggered by the live master volume watcher.
 	lastPushedMasterVolume float32
 	havePushedMasterVolume bool
+
+	// last master mute (volMuted) state successfully pushed to SERENITY; used to
+	// dedupe redundant pushes triggered by the live master volume watcher.
+	lastPushedVolMuted bool
+	havePushedVolMuted bool
 }
 
 // NewDisplayManager creates a DisplayManager and wires it to SerialIO connection and beacon events.
@@ -64,6 +69,7 @@ func (dm *DisplayManager) subscribeToSerialEvents() {
 	beaconCh := dm.deej.serial.SubscribeToBeaconEvents()
 	deviceCmdCh := dm.deej.serial.SubscribeToDeviceCommands()
 	masterVolCh := dm.deej.sessions.SubscribeToMasterVolumeChanges()
+	micMuteCh := dm.deej.sessions.SubscribeToMicMuteChanges()
 
 	go func() {
 		for {
@@ -94,16 +100,23 @@ func (dm *DisplayManager) subscribeToSerialEvents() {
 
 			case update := <-masterVolCh:
 				dm.handleExternalMasterVolumeChange(update)
+
+			case muted := <-micMuteCh:
+				dm.handleExternalMicMuteChange(muted)
 			}
 		}
 	}()
 }
 
-// handleExternalMasterVolumeChange pushes a master volume change down to SERENITY
-// in response to a live, externally-sourced change (Windows volume mixer, media
-// keys, another app) reported by the platform's MasterVolumeWatcher. Pushes the
-// encoder itself caused are already filtered out before reaching this point -
-// see sessionMap.setupMasterVolumeWatcher.
+// handleExternalMasterVolumeChange pushes a master volume and/or mute change
+// down to SERENITY in response to a live, externally-sourced change (Windows
+// volume mixer, media keys, another app) reported by the platform's
+// MasterVolumeWatcher. Changes the encoder itself caused are already filtered
+// out before reaching this point - see sessionMap.setupMasterVolumeWatcher.
+// Volume and mute are independent pushes (separate commands, separate dedupe
+// state) even though they arrive together in one update, since either can
+// change without the other (e.g. muting via the mixer's mute button alone
+// leaves the volume level untouched).
 func (dm *DisplayManager) handleExternalMasterVolumeChange(update MasterVolumeUpdate) {
 	writer := dm.deej.serial.Writer()
 	if writer == nil {
@@ -115,20 +128,48 @@ func (dm *DisplayManager) handleExternalMasterVolumeChange(update MasterVolumeUp
 	// value the live path may have gotten slightly wrong, so a small/no-op-
 	// looking difference from the last pushed value is exactly the case it
 	// needs to still go through.
-	if !update.ForceSync && dm.havePushedMasterVolume &&
-		!util.SignificantlyDifferent(dm.lastPushedMasterVolume, update.Volume, dm.deej.config.NoiseReductionLevel) {
+	if update.ForceSync || !dm.havePushedMasterVolume ||
+		util.SignificantlyDifferent(dm.lastPushedMasterVolume, update.Volume, dm.deej.config.NoiseReductionLevel) {
+
+		raw := uint16(update.Volume*1023 + 0.5)
+		if err := writer.SendMasterVolume(raw); err != nil {
+			dm.logger.Warnw("Failed to send live master volume update", "error", err)
+		} else {
+			dm.lastPushedMasterVolume = update.Volume
+			dm.havePushedMasterVolume = true
+			dm.logger.Debugw("Pushed live master volume update", "raw", raw, "forceSync", update.ForceSync)
+		}
+	}
+
+	if update.ForceSync || !dm.havePushedVolMuted || update.Muted != dm.lastPushedVolMuted {
+		if err := writer.SendMasterMuteState(update.Muted); err != nil {
+			dm.logger.Warnw("Failed to send live master mute update", "error", err)
+		} else {
+			dm.lastPushedVolMuted = update.Muted
+			dm.havePushedVolMuted = true
+			dm.logger.Debugw("Pushed live master mute update", "muted", update.Muted, "forceSync", update.ForceSync)
+		}
+	}
+}
+
+// handleExternalMicMuteChange pushes a mic mute change down to SERENITY in
+// response to a live, externally-sourced change (Windows mic settings/taskbar,
+// another app) reported by the platform's MicMuteWatcher. Changes from
+// SERENITY's own RGB button are already filtered out before reaching this
+// point and pushed directly by HIDManager.handleReport instead - see
+// wcaSessionFinder.micMuteNotifyCallback.
+func (dm *DisplayManager) handleExternalMicMuteChange(muted bool) {
+	writer := dm.deej.serial.Writer()
+	if writer == nil {
 		return
 	}
 
-	raw := uint16(update.Volume*1023 + 0.5)
-	if err := writer.SendMasterVolume(raw); err != nil {
-		dm.logger.Warnw("Failed to send live master volume update", "error", err)
+	if err := writer.SendMicMuteState(muted); err != nil {
+		dm.logger.Warnw("Failed to send live mic mute update", "error", err)
 		return
 	}
 
-	dm.lastPushedMasterVolume = update.Volume
-	dm.havePushedMasterVolume = true
-	dm.logger.Debugw("Pushed live master volume update", "raw", raw, "forceSync", update.ForceSync)
+	dm.logger.Debugw("Pushed live mic mute update", "muted", muted)
 }
 
 // handleDeviceCommand dispatches a binary command received from SERENITY.
@@ -205,6 +246,18 @@ func (dm *DisplayManager) pushMasterState(writer *SerialWriter) {
 		dm.logger.Warnw("Failed to send mic mute state", "error", err)
 	} else {
 		dm.logger.Debugw("Sent mic mute state", "muted", muted)
+	}
+
+	if muted, ok := dm.deej.sessions.getMasterMuted(); ok {
+		if err := writer.SendMasterMuteState(muted); err != nil {
+			dm.logger.Warnw("Failed to send master mute state", "error", err)
+		} else {
+			dm.logger.Debugw("Sent master mute state", "muted", muted)
+			dm.lastPushedVolMuted = muted
+			dm.havePushedVolMuted = true
+		}
+	} else {
+		dm.logger.Debug("Master mute state not available, skipping push")
 	}
 }
 
