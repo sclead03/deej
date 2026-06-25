@@ -280,46 +280,111 @@ func (m *windowsMicMuter) withCaptureVolume(fn func(aev *wca.IAudioEndpointVolum
 	return fn(aev)
 }
 
-func (m *windowsMicMuter) ToggleMute() error {
-	// Deliberately doesn't touch m (the receiver) from inside the closure -
-	// only aev and a plain local. The crash reproduced here consistently
-	// pointed at m.logger.Debugw called from inside this closure immediately
-	// after the COM calls returned; IsMuted's closure (which never touches m)
-	// never crashed. Logging after withCaptureVolume returns instead, fully
-	// outside the COM/syscall call chain, avoids whatever that interaction is.
-	//
-	// SetMute's eventContext arg is deliberately always nil here (never a real
-	// *ole.GUID) - passing a real one, even captured as a plain local before
-	// the closure, reproduced a hard access violation crash inside the
-	// aevSetMute syscall itself every time (confirmed via a console build's
-	// crash trace, pointing straight at iaudioendpointvolume_windows.go's
-	// SetMute syscall). withCaptureVolume's per-call CoInitializeEx/LockOSThread
-	// cycle makes this whole call chain fragile in ways not fully understood
-	// (see the closure-receiver crash above, a different but related issue) -
-	// don't add a non-nil pointer argument to this specific syscall again.
-	// Self-triggered mute changes are instead recognized by sessionMap via a
-	// time-window check (markMicMuteSetByButton), not a GUID, applied entirely
-	// in plain Go code with no COM/syscall involvement.
-	var nowMuted bool
-	err := m.withCaptureVolume(func(aev *wca.IAudioEndpointVolume) error {
-		var muted bool
-		if err := aev.GetMute(&muted); err != nil {
-			return fmt.Errorf("get mute state: %w", err)
-		}
+// applyToDevices enumerates active capture devices and sets mute on those whose
+// friendly name contains any of the targets (case-insensitive substring). If
+// targets contains the sentinel mute.all (muted=true) or unmute.all (muted=false)
+// every active capture device is affected.
+//
+// Same LockOSThread/CoInitializeEx threading discipline as withCaptureVolume —
+// see that function for the full rationale. SetMute eventContext is always nil
+// for the same crash-avoidance reason documented on the old ToggleMute.
+func (m *windowsMicMuter) applyToDevices(muted bool, targets []string) error {
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
 
-		if err := aev.SetMute(!muted, nil); err != nil {
-			return fmt.Errorf("set mute state: %w", err)
+	if err := ole.CoInitializeEx(0, ole.COINIT_APARTMENTTHREADED); err != nil {
+		const eFalse = 1
+		oleError := &ole.OleError{}
+		if errors.As(err, &oleError) {
+			if oleError.Code() != eFalse {
+				return fmt.Errorf("CoInitializeEx: %w", err)
+			}
+		} else {
+			return fmt.Errorf("CoInitializeEx: %w", err)
 		}
+	}
+	defer ole.CoUninitialize()
 
-		nowMuted = !muted
-		return nil
-	})
-	if err != nil {
-		return err
+	var de *wca.IMMDeviceEnumerator
+	if err := wca.CoCreateInstance(
+		wca.CLSID_MMDeviceEnumerator, 0, wca.CLSCTX_ALL,
+		wca.IID_IMMDeviceEnumerator, &de,
+	); err != nil {
+		return fmt.Errorf("create IMMDeviceEnumerator: %w", err)
+	}
+	defer de.Release()
+
+	var dc *wca.IMMDeviceCollection
+	if err := de.EnumAudioEndpoints(wca.ECapture, wca.DEVICE_STATE_ACTIVE, &dc); err != nil {
+		return fmt.Errorf("enum capture endpoints: %w", err)
+	}
+	defer dc.Release()
+
+	var count uint32
+	if err := dc.GetCount(&count); err != nil {
+		return fmt.Errorf("get device count: %w", err)
 	}
 
-	m.logger.Debugw("Toggled mic mute", "nowMuted", nowMuted)
+	sentinel := micMuteSentinelAll
+	if !muted {
+		sentinel = micUnmuteSentinelAll
+	}
+	applyAll := false
+	for _, t := range targets {
+		if strings.EqualFold(t, sentinel) {
+			applyAll = true
+			break
+		}
+	}
+
+	applied := 0
+	for i := uint32(0); i < count; i++ {
+		var dev *wca.IMMDevice
+		if err := dc.Item(i, &dev); err != nil {
+			continue
+		}
+
+		matches := applyAll
+		if !matches {
+			var ps *wca.IPropertyStore
+			if err := dev.OpenPropertyStore(wca.STGM_READ, &ps); err == nil {
+				value := &wca.PROPVARIANT{}
+				if err := ps.GetValue(&wca.PKEY_Device_FriendlyName, value); err == nil {
+					lowerName := strings.ToLower(value.String())
+					for _, t := range targets {
+						if !strings.EqualFold(t, sentinel) && strings.Contains(lowerName, strings.ToLower(t)) {
+							matches = true
+							break
+						}
+					}
+				}
+				ps.Release()
+			}
+		}
+
+		if matches {
+			var aev *wca.IAudioEndpointVolume
+			if err := dev.Activate(wca.IID_IAudioEndpointVolume, wca.CLSCTX_ALL, nil, &aev); err == nil {
+				if err := aev.SetMute(muted, nil); err == nil {
+					applied++
+				}
+				aev.Release()
+			}
+		}
+
+		dev.Release()
+	}
+
+	m.logger.Debugw("Applied mute to capture devices", "muted", muted, "applied", applied, "total", count)
 	return nil
+}
+
+func (m *windowsMicMuter) MuteDevices(targets []string) error {
+	return m.applyToDevices(true, targets)
+}
+
+func (m *windowsMicMuter) UnmuteDevices(targets []string) error {
+	return m.applyToDevices(false, targets)
 }
 
 // IsMuted reports the current system microphone mute state.

@@ -37,11 +37,7 @@ type Deej struct {
 func NewDeej(logger *zap.SugaredLogger, verbose bool) (*Deej, error) {
 	logger = logger.Named("deej")
 
-	notifier, err := NewToastNotifier(logger)
-	if err != nil {
-		logger.Errorw("Failed to create ToastNotifier", "error", err)
-		return nil, fmt.Errorf("create new ToastNotifier: %w", err)
-	}
+	notifier := newSilentNotifier(logger)
 
 	config, err := NewConfig(logger, notifier)
 	if err != nil {

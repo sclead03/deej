@@ -2,9 +2,15 @@
 # you can use 'master' to indicate the master channel, or a list of process names to create a group
 # you can use 'mic' to control your mic input level (uses the default recording device)
 # you can use 'deej.unmapped' to control all apps that aren't bound to any slider (this ignores master, system, mic and device-targeting sessions)
+# lists are allowed on each channel; [app1.exe, app2.exe] or formatted as:
+#  - app1.exe
+#  - app2.exe
+
 # windows only - you can use 'deej.current' to control the currently active app (whether full-screen or not)
 # windows only - you can use a device's full name, i.e. "Speakers (Realtek High Definition Audio)", to bind it. this works for both output and input devices
 # windows only - you can use 'system' to control the "system sounds" volume
+
+
 # SERENITY channel layout: index 0 = master volume encoder, indices 1-5 = analog faders
 slider_mapping:
   0: master
@@ -17,26 +23,31 @@ slider_mapping:
 # directory containing PNG icon files for channel OLEDs; relative to deej-x.exe or absolute
 icon_dir: icons
 
-# 1-bit conversion method per channel: "dither" (Floyd-Steinberg) or "threshold"
-# One entry per channel (indices 0-4, corresponding to faders 1-5). If only a 
-#single value is entered, it applies to all channels.
-# Dithering softens anti-aliased edges; threshold gives a hard binary cutoff.
-icon_conversion:
-  - threshold
-  - threshold
-  - threshold
-  - threshold
-  - threshold
-
-# display names for SERENITY channel OLEDs (indices 0-4, corresponding to faders 1-5)
+# display names for SERENITY OLEDs; 0 = master encoder label, 1-5 = fader OLEDs (match slider_mapping keys)
 # Accented characters supported: é, É, ü, Ü, ö, Ö, ä, Ä, ñ, Ñ
+# Supported ASCII symbols: ! " # $ % & ' ( ) * + , - . / : ; < = > ? @ [ \ ] ^ _  { | } ~`
 # 15-character limit
 channel_names:
-  - Firefox
-  - Spotify
-  - Unmapped
-  - éÉ üÜ öÖ äÄ ñÑ
-  - System
+  0: MASTER
+  1: Firefox
+  2: Spotify
+  3: Unmapped
+  4: VLC Media
+  5: System
+
+# mic mute button behaviour: which capture devices are muted/unmuted on each press
+# targets are case-insensitive friendly-name substrings, e.g. "Razer Microphone"
+# mute.all   → mute every active capture device
+# unmute.all → unmute every active capture device
+# lists are supported: unmute_action: ["Razer Microphone", "USB Audio"]
+mic_mute:
+  mute_action: mute.all
+  unmute_action: unmute.all
+
+# remap physical fader order without reflashing firmware
+# fader_order[i] = which physical fader position (0-4) feeds logical slot i
+# example: swap faders 0 and 1 → [1, 0, 2, 3, 4]
+fader_order: [0, 1, 2, 3, 4]
 
 # set this to true if you want the controls inverted (i.e. top is 0%, bottom is 100%)
 invert_sliders: false

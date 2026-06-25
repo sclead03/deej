@@ -3,6 +3,7 @@ package deej
 import (
 	"fmt"
 	"path"
+	"strconv"
 	"strings"
 	"time"
 
@@ -12,6 +13,14 @@ import (
 
 	"github.com/sclead03/deej-x/pkg/deej/util"
 )
+
+// MicMuteConfig specifies which capture devices are affected by mute/unmute button presses.
+// Targets are case-insensitive friendly-name substrings (e.g. "Razer Microphone") or the
+// sentinels micMuteSentinelAll ("mute.all") / micUnmuteSentinelAll ("unmute.all").
+type MicMuteConfig struct {
+	MuteAction   []string
+	UnmuteAction []string
+}
 
 // CanonicalConfig provides application-wide access to configuration fields,
 // as well as loading/file watching logic for deej's configuration file
@@ -25,9 +34,11 @@ type CanonicalConfig struct {
 
 	InvertSliders       bool
 	NoiseReductionLevel string
+	FaderOrder          []int
+	MasterLabel         string
 	ChannelNames        [numChannels]string
 	IconDir             string
-	IconConversion      [numChannels]string
+	MicMute             MicMuteConfig
 
 	logger             *zap.SugaredLogger
 	notifier           Notifier
@@ -55,14 +66,15 @@ const (
 	configKeyCOMPort             = "com_port"
 	configKeyBaudRate            = "baud_rate"
 	configKeyNoiseReductionLevel = "noise_reduction"
-	configKeyChannelNames        = "channel_names"
-	configKeyIconDir             = "icon_dir"
-	configKeyIconConversion      = "icon_conversion"
+	configKeyFaderOrder        = "fader_order"
+	configKeyChannelNames      = "channel_names"
+	configKeyIconDir           = "icon_dir"
+	configKeyMicMuteMuteAction = "mic_mute.mute_action"
+	configKeyMicMuteUnmuteAct  = "mic_mute.unmute_action"
 
-	defaultCOMPort        = "COM4"
-	defaultBaudRate       = 115200
-	defaultIconDir        = "icons"
-	defaultIconConversion = "dither"
+	defaultCOMPort  = "COM4"
+	defaultBaudRate = 115200
+	defaultIconDir  = "icons"
 )
 
 // has to be defined as a non-constant because we're using path.Join
@@ -96,9 +108,7 @@ func NewConfig(logger *zap.SugaredLogger, notifier Notifier) (*CanonicalConfig, 
 	userConfig.SetDefault(configKeyInvertSliders, false)
 	userConfig.SetDefault(configKeyCOMPort, defaultCOMPort)
 	userConfig.SetDefault(configKeyBaudRate, defaultBaudRate)
-	userConfig.SetDefault(configKeyChannelNames, []string{})
 	userConfig.SetDefault(configKeyIconDir, defaultIconDir)
-	userConfig.SetDefault(configKeyIconConversion, defaultIconConversion)
 
 	internalConfig := viper.New()
 	internalConfig.SetConfigName(internalConfigName)
@@ -157,9 +167,9 @@ func (cc *CanonicalConfig) Load() error {
 		"sliderMapping", cc.SliderMapping,
 		"connectionInfo", cc.ConnectionInfo,
 		"invertSliders", cc.InvertSliders,
+		"masterLabel", cc.MasterLabel,
 		"channelNames", cc.ChannelNames,
-		"iconDir", cc.IconDir,
-		"iconConversion", cc.IconConversion)
+		"iconDir", cc.IconDir)
 
 	return nil
 }
@@ -252,24 +262,50 @@ func (cc *CanonicalConfig) populateFromVipers() error {
 	cc.InvertSliders = cc.userConfig.GetBool(configKeyInvertSliders)
 	cc.NoiseReductionLevel = cc.userConfig.GetString(configKeyNoiseReductionLevel)
 
-	names := cc.userConfig.GetStringSlice(configKeyChannelNames)
-	for i := 0; i < numChannels && i < len(names); i++ {
-		cc.ChannelNames[i] = names[i]
+	rawOrder := cc.userConfig.GetIntSlice(configKeyFaderOrder)
+	if len(rawOrder) > 0 {
+		seen := make(map[int]bool, len(rawOrder))
+		valid := true
+		for _, v := range rawOrder {
+			if v < 0 || v >= len(rawOrder) || seen[v] {
+				valid = false
+				break
+			}
+			seen[v] = true
+		}
+		if valid {
+			cc.FaderOrder = rawOrder
+		} else {
+			cc.logger.Warnw("fader_order is not a valid permutation, using physical order", "value", rawOrder)
+			cc.FaderOrder = nil
+		}
+	} else {
+		cc.FaderOrder = nil
+	}
+
+	// channel_names is a map: key "0" = master OLED label, keys "1"–"5" = fader OLED names
+	namesMap := cc.userConfig.GetStringMapString(configKeyChannelNames)
+	if label, ok := namesMap["0"]; ok && label != "" {
+		cc.MasterLabel = label
+	} else {
+		cc.MasterLabel = "MASTER"
+	}
+	cc.ChannelNames = [numChannels]string{}
+	for i := 1; i <= numChannels; i++ {
+		if name, ok := namesMap[strconv.Itoa(i)]; ok {
+			cc.ChannelNames[i-1] = name
+		}
 	}
 
 	cc.IconDir = cc.userConfig.GetString(configKeyIconDir)
 
-	conversions := cc.userConfig.GetStringSlice(configKeyIconConversion)
-	defaultConv := defaultIconConversion
-	if len(conversions) > 0 {
-		defaultConv = conversions[0]
+	cc.MicMute.MuteAction = cc.userConfig.GetStringSlice(configKeyMicMuteMuteAction)
+	if len(cc.MicMute.MuteAction) == 0 {
+		cc.MicMute.MuteAction = []string{micMuteSentinelAll}
 	}
-	for i := 0; i < numChannels; i++ {
-		if i < len(conversions) {
-			cc.IconConversion[i] = conversions[i]
-		} else {
-			cc.IconConversion[i] = defaultConv
-		}
+	cc.MicMute.UnmuteAction = cc.userConfig.GetStringSlice(configKeyMicMuteUnmuteAct)
+	if len(cc.MicMute.UnmuteAction) == 0 {
+		cc.MicMute.UnmuteAction = []string{micUnmuteSentinelAll}
 	}
 
 	cc.logger.Debug("Populated config fields from vipers")

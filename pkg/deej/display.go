@@ -10,7 +10,7 @@ import (
 )
 
 // numChannels is the number of channel OLEDs on SERENITY (indices 0–4, mapped to faders 1–5).
-// The master OLED is firmware-controlled and receives no host commands.
+// The master OLED label is sent via SET_CHANNEL_NAME with index numChannels (5).
 const numChannels = 5
 
 // cmdRequestIconRedraw is the device->host command SERENITY sends during its
@@ -29,8 +29,9 @@ type DisplayManager struct {
 	logger *zap.SugaredLogger
 
 	// last successfully sent state per channel; used to skip unchanged channels on manual push
-	lastSentNames [numChannels]string
-	lastSentIcons [numChannels][]byte
+	lastSentMasterLabel string
+	lastSentNames       [numChannels]string
+	lastSentIcons       [numChannels][]byte
 
 	// last master volume scalar successfully pushed to SERENITY; used to dedupe
 	// redundant pushes triggered by the live master volume watcher.
@@ -164,6 +165,10 @@ func (dm *DisplayManager) handleExternalMasterVolumeChange(update MasterVolumeUp
 // point and pushed directly by HIDManager.handleReport instead - see
 // wcaSessionFinder.micMuteNotifyCallback.
 func (dm *DisplayManager) handleExternalMicMuteChange(muted bool) {
+	// Keep HIDManager's tracked state in sync so the next button press
+	// toggles correctly from the externally-observed state.
+	dm.deej.hid.SetCurrentMuteState(muted)
+
 	writer := dm.deej.serial.Writer()
 	if writer == nil {
 		return
@@ -244,9 +249,8 @@ func (dm *DisplayManager) handleIconRedrawRequest(payload []byte) {
 		return
 	}
 	processName := targets[0]
-	iconConversion := dm.deej.config.IconConversion[channel]
 
-	bitmap, err := icon.LoadAt(processName, dm.deej.config.IconDir, iconConversion, xOffset, yOffset)
+	bitmap, err := icon.LoadAt(processName, dm.deej.config.IconDir, xOffset, yOffset)
 	if err != nil {
 		dm.logger.Debugw("No icon for channel during screensaver redraw", "channel", channel, "process", processName, "error", err)
 		return
@@ -306,8 +310,6 @@ func (dm *DisplayManager) pushAll(writer *SerialWriter, force bool) {
 	iconDir := dm.deej.config.IconDir
 
 	for i := 0; i < numChannels; i++ {
-		iconConversion := dm.deej.config.IconConversion[i]
-
 		// name
 		name := names[i]
 		if force || name != dm.lastSentNames[i] {
@@ -329,7 +331,7 @@ func (dm *DisplayManager) pushAll(writer *SerialWriter, force bool) {
 			continue
 		}
 
-		bitmap, err := icon.Load(processName, iconDir, iconConversion)
+		bitmap, err := icon.Load(processName, iconDir)
 		if err != nil {
 			dm.logger.Debugw("No icon for channel", "channel", i, "process", processName, "error", err)
 			continue
@@ -346,5 +348,16 @@ func (dm *DisplayManager) pushAll(writer *SerialWriter, force bool) {
 
 		dm.lastSentIcons[i] = bitmap
 		dm.logger.Debugw("Sent channel icon", "channel", i, "process", processName)
+	}
+
+	// master OLED label: channel index numChannels (5) — firmware accepts this via SET_CHANNEL_NAME
+	masterLabel := dm.deej.config.MasterLabel
+	if force || masterLabel != dm.lastSentMasterLabel {
+		if err := writer.SendChannelName(byte(numChannels), masterLabel); err != nil {
+			dm.logger.Warnw("Failed to send master label", "error", err)
+		} else {
+			dm.lastSentMasterLabel = masterLabel
+			dm.logger.Debugw("Sent master label", "label", masterLabel)
+		}
 	}
 }

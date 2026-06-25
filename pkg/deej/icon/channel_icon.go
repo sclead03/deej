@@ -25,16 +25,16 @@ const (
 // Load returns a 768-byte SSD1306 page-order frame for the given process name,
 // with the icon centered in the blue area. Equivalent to LoadAt with the
 // default centered offset.
-func Load(processName, iconDir, conversion string) ([]byte, error) {
-	return LoadAt(processName, iconDir, conversion, iconLeftPad, iconTopPad)
+func Load(processName, iconDir string) ([]byte, error) {
+	return LoadAt(processName, iconDir, iconLeftPad, iconTopPad)
 }
 
 // LoadAt is identical to Load but places the icon at an arbitrary (xOffset, yOffset)
 // within the 128x48 blue area instead of centering it — used to reposition a
 // channel's icon during the screensaver bounce (CMD_REQUEST_ICON_REDRAW). Offsets
 // are clamped to keep the icon fully on-screen.
-func LoadAt(processName, iconDir, conversion string, xOffset, yOffset int) ([]byte, error) {
-	mono, err := loadMono(processName, iconDir, conversion)
+func LoadAt(processName, iconDir string, xOffset, yOffset int) ([]byte, error) {
+	mono, err := loadMono(processName, iconDir)
 	if err != nil {
 		return nil, err
 	}
@@ -56,10 +56,9 @@ func LoadAt(processName, iconDir, conversion string, xOffset, yOffset int) ([]by
 // loadMono decodes processName's icon PNG and converts it to a IconWidth x
 // IconHeight row-major 1-bit mask. processName has ".exe" stripped and is
 // matched case-insensitively to a PNG file in iconDir. "deej.unmapped" maps to
-// "unmapped.png". conversion is "dither" (Floyd-Steinberg) or "threshold" —
-// used only for fully opaque images. Transparent images use alpha as the
-// content mask instead.
-func loadMono(processName, iconDir, conversion string) ([]bool, error) {
+// "unmapped.png". Transparent images use alpha as the content mask; opaque
+// images are grayscaled and thresholded at 128.
+func loadMono(processName, iconDir string) ([]bool, error) {
 	base := strings.TrimSuffix(strings.ToLower(processName), ".exe")
 	if base == "deej.unmapped" {
 		base = "unmapped"
@@ -86,28 +85,14 @@ func loadMono(processName, iconDir, conversion string) ([]bool, error) {
 	mono := make([]bool, IconWidth*IconHeight)
 
 	if hasTransparency(nrgba) {
-		// Use alpha channel as content mask: transparent=off, opaque=on.
-		// Apply the same dither/threshold choice as the grayscale path so that
-		// anti-aliased edges are smoothed rather than hard-cut.
 		alphaScaled := boxResizeAlpha(nrgba, IconWidth, IconHeight)
-		switch conversion {
-		case "threshold":
-			for i, a := range alphaScaled {
-				mono[i] = a >= 128
-			}
-		default:
-			applyFloydSteinbergAlpha(alphaScaled, mono)
+		for i, a := range alphaScaled {
+			mono[i] = a >= 128
 		}
 	} else {
-		// Fully opaque image: use grayscale brightness + threshold or dither.
 		scaled := boxResize(nrgba, IconWidth, IconHeight)
 		gray := toGray(scaled)
-		switch conversion {
-		case "threshold":
-			applyThreshold(gray, mono)
-		default:
-			applyFloydSteinberg(gray, mono)
-		}
+		applyThreshold(gray, mono)
 	}
 
 	return mono, nil
@@ -218,70 +203,6 @@ func applyThreshold(g *image.Gray, mono []bool) {
 	for y := 0; y < IconHeight; y++ {
 		for x := 0; x < IconWidth; x++ {
 			mono[y*IconWidth+x] = g.GrayAt(x, y).Y >= 128
-		}
-	}
-}
-
-func applyFloydSteinberg(g *image.Gray, mono []bool) {
-	buf := make([]float32, IconWidth*IconHeight)
-	for y := 0; y < IconHeight; y++ {
-		for x := 0; x < IconWidth; x++ {
-			buf[y*IconWidth+x] = float32(g.GrayAt(x, y).Y)
-		}
-	}
-
-	for y := 0; y < IconHeight; y++ {
-		for x := 0; x < IconWidth; x++ {
-			old := buf[y*IconWidth+x]
-			var q float32
-			if old >= 128 {
-				q = 255
-				mono[y*IconWidth+x] = true
-			}
-			e := old - q
-
-			if x+1 < IconWidth {
-				buf[y*IconWidth+x+1] += e * 7 / 16
-			}
-			if y+1 < IconHeight {
-				if x > 0 {
-					buf[(y+1)*IconWidth+x-1] += e * 3 / 16
-				}
-				buf[(y+1)*IconWidth+x] += e * 5 / 16
-				if x+1 < IconWidth {
-					buf[(y+1)*IconWidth+x+1] += e * 1 / 16
-				}
-			}
-		}
-	}
-}
-
-func applyFloydSteinbergAlpha(alpha []uint8, mono []bool) {
-	buf := make([]float32, IconWidth*IconHeight)
-	for i, a := range alpha {
-		buf[i] = float32(a)
-	}
-	for y := 0; y < IconHeight; y++ {
-		for x := 0; x < IconWidth; x++ {
-			old := buf[y*IconWidth+x]
-			var q float32
-			if old >= 128 {
-				q = 255
-				mono[y*IconWidth+x] = true
-			}
-			e := old - q
-			if x+1 < IconWidth {
-				buf[y*IconWidth+x+1] += e * 7 / 16
-			}
-			if y+1 < IconHeight {
-				if x > 0 {
-					buf[(y+1)*IconWidth+x-1] += e * 3 / 16
-				}
-				buf[(y+1)*IconWidth+x] += e * 5 / 16
-				if x+1 < IconWidth {
-					buf[(y+1)*IconWidth+x+1] += e * 1 / 16
-				}
-			}
 		}
 	}
 }

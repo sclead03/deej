@@ -25,13 +25,24 @@ func newMicMuter(logger *zap.SugaredLogger) (MicMuter, error) {
 	return &linuxMicMuter{logger: logger.Named("mic_muter")}, nil
 }
 
-func (m *linuxMicMuter) ToggleMute() error {
-	cmd := exec.Command("pactl", "set-source-mute", "@DEFAULT_SOURCE@", "toggle")
-	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("pactl toggle mic mute: %w", err)
-	}
+func (m *linuxMicMuter) MuteDevices(targets []string) error {
+	return m.applyPactl(targets, micMuteSentinelAll, "1")
+}
 
-	m.logger.Debug("Toggled mic mute via pactl")
+func (m *linuxMicMuter) UnmuteDevices(targets []string) error {
+	return m.applyPactl(targets, micUnmuteSentinelAll, "0")
+}
+
+func (m *linuxMicMuter) applyPactl(targets []string, sentinel, state string) error {
+	for _, t := range targets {
+		source := t
+		if strings.EqualFold(t, sentinel) {
+			source = "@DEFAULT_SOURCE@"
+		}
+		if err := exec.Command("pactl", "set-source-mute", source, state).Run(); err != nil {
+			m.logger.Warnw("Failed to set source mute via pactl", "source", source, "state", state, "error", err)
+		}
+	}
 	return nil
 }
 

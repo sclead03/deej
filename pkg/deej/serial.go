@@ -402,6 +402,17 @@ func (sio *SerialIO) handleLine(logger *zap.SugaredLogger, line string) {
 		}
 	}
 
+	// Apply fader_order remapping: rearrange the 5 fader slots (indices 1-5) according
+	// to the configured permutation, leaving index 0 (master encoder) untouched.
+	if order := sio.deej.config.FaderOrder; len(order) == numSliders-1 {
+		reordered := make([]string, numSliders)
+		reordered[0] = splitLine[0]
+		for logicalIdx, physicalIdx := range order {
+			reordered[logicalIdx+1] = splitLine[physicalIdx+1]
+		}
+		splitLine = reordered
+	}
+
 	// for each slider:
 	moveEvents := []SliderMoveEvent{}
 	for sliderIdx, stringValue := range splitLine {
