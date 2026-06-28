@@ -231,7 +231,8 @@ func newMicMuter(logger *zap.SugaredLogger) (MicMuter, error) {
 // queryCaptureAllMuted enumerates all active capture devices via de and returns
 // true only if every one of them is muted. Returns false if there are no active
 // capture devices. Assumes COM is already initialized on the calling thread.
-func queryCaptureAllMuted(de *wca.IMMDeviceEnumerator) (bool, error) {
+// logger is used for per-device debug tracing; pass nil to suppress.
+func queryCaptureAllMuted(de *wca.IMMDeviceEnumerator, logger *zap.SugaredLogger) (bool, error) {
 	var dc *wca.IMMDeviceCollection
 	if err := de.EnumAudioEndpoints(wca.ECapture, wca.DEVICE_STATE_ACTIVE, &dc); err != nil {
 		return false, fmt.Errorf("enum capture endpoints: %w", err)
@@ -244,6 +245,9 @@ func queryCaptureAllMuted(de *wca.IMMDeviceEnumerator) (bool, error) {
 	}
 
 	if count == 0 {
+		if logger != nil {
+			logger.Debugw("queryCaptureAllMuted: no active capture devices")
+		}
 		return false, nil
 	}
 
@@ -251,6 +255,16 @@ func queryCaptureAllMuted(de *wca.IMMDeviceEnumerator) (bool, error) {
 		var dev *wca.IMMDevice
 		if err := dc.Item(i, &dev); err != nil {
 			continue
+		}
+
+		var friendlyName string
+		var ps *wca.IPropertyStore
+		if dev.OpenPropertyStore(wca.STGM_READ, &ps) == nil {
+			pv := &wca.PROPVARIANT{}
+			if ps.GetValue(&wca.PKEY_Device_FriendlyName, pv) == nil {
+				friendlyName = pv.String()
+			}
+			ps.Release()
 		}
 
 		var aev *wca.IAudioEndpointVolume
@@ -265,7 +279,13 @@ func queryCaptureAllMuted(de *wca.IMMDeviceEnumerator) (bool, error) {
 		dev.Release()
 
 		if getMuteErr != nil {
+			if logger != nil {
+				logger.Debugw("GetMute failed", "deviceIdx", i, "device", friendlyName, "error", getMuteErr)
+			}
 			continue
+		}
+		if logger != nil {
+			logger.Debugw("GetMute result", "deviceIdx", i, "device", friendlyName, "muted", muted)
 		}
 		if !muted {
 			return false, nil
@@ -332,6 +352,8 @@ func (m *windowsMicMuter) applyToDevices(muted bool, targets []string) error {
 		}
 	}
 
+	m.logger.Debugw("applyToDevices start", "muted", muted, "targets", targets, "applyAll", applyAll, "total", count)
+
 	applied := 0
 	for i := uint32(0); i < count; i++ {
 		var dev *wca.IMMDevice
@@ -339,38 +361,48 @@ func (m *windowsMicMuter) applyToDevices(muted bool, targets []string) error {
 			continue
 		}
 
+		var friendlyName string
+		var ps *wca.IPropertyStore
+		if dev.OpenPropertyStore(wca.STGM_READ, &ps) == nil {
+			pv := &wca.PROPVARIANT{}
+			if ps.GetValue(&wca.PKEY_Device_FriendlyName, pv) == nil {
+				friendlyName = pv.String()
+			}
+			ps.Release()
+		}
+
 		matches := applyAll
 		if !matches {
-			var ps *wca.IPropertyStore
-			if err := dev.OpenPropertyStore(wca.STGM_READ, &ps); err == nil {
-				value := &wca.PROPVARIANT{}
-				if err := ps.GetValue(&wca.PKEY_Device_FriendlyName, value); err == nil {
-					lowerName := strings.ToLower(value.String())
-					for _, t := range targets {
-						if !strings.EqualFold(t, sentinel) && strings.Contains(lowerName, strings.ToLower(t)) {
-							matches = true
-							break
-						}
-					}
+			lowerName := strings.ToLower(friendlyName)
+			for _, t := range targets {
+				if !strings.EqualFold(t, sentinel) && strings.Contains(lowerName, strings.ToLower(t)) {
+					matches = true
+					break
 				}
-				ps.Release()
 			}
 		}
+
+		m.logger.Debugw("Capture device", "deviceIdx", i, "device", friendlyName, "matches", matches)
 
 		if matches {
 			var aev *wca.IAudioEndpointVolume
 			if err := dev.Activate(wca.IID_IAudioEndpointVolume, wca.CLSCTX_ALL, nil, &aev); err == nil {
 				if err := aev.SetMute(muted, nil); err == nil {
 					applied++
+					m.logger.Debugw("SetMute succeeded", "deviceIdx", i, "device", friendlyName, "muted", muted)
+				} else {
+					m.logger.Debugw("SetMute failed", "deviceIdx", i, "device", friendlyName, "muted", muted, "error", err)
 				}
 				aev.Release()
+			} else {
+				m.logger.Debugw("Activate AEV failed", "deviceIdx", i, "device", friendlyName, "error", err)
 			}
 		}
 
 		dev.Release()
 	}
 
-	m.logger.Debugw("Applied mute to capture devices", "muted", muted, "applied", applied, "total", count)
+	m.logger.Debugw("applyToDevices done", "muted", muted, "applied", applied, "total", count)
 	return nil
 }
 
@@ -411,5 +443,9 @@ func (m *windowsMicMuter) IsMuted() (bool, error) {
 	}
 	defer de.Release()
 
-	return queryCaptureAllMuted(de)
+	muted, err := queryCaptureAllMuted(de, m.logger)
+	if err == nil {
+		m.logger.Debugw("IsMuted aggregate result", "allMuted", muted)
+	}
+	return muted, err
 }

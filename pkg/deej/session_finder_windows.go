@@ -846,7 +846,7 @@ func (sf *wcaSessionFinder) allCaptureDevicesMuted() (bool, error) {
 	}
 	defer de.Release()
 
-	return queryCaptureAllMuted(de)
+	return queryCaptureAllMuted(de, sf.logger)
 }
 
 // micMuteNotifyCallback is invoked by the Windows audio engine whenever any
@@ -980,7 +980,7 @@ func (sf *wcaSessionFinder) handleDeviceStateChanged() {
 	}
 
 	// Push the updated aggregate state (using the same enumerator, already on this COM-initialized thread).
-	muted, err := queryCaptureAllMuted(de)
+	muted, err := queryCaptureAllMuted(de, sf.logger)
 	if err != nil {
 		sf.logger.Warnw("Failed to query aggregate after device state change", "error", err)
 		return

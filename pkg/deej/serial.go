@@ -334,9 +334,7 @@ func (sio *SerialIO) readFrames(logger *zap.SugaredLogger, reader *bufio.Reader)
 					}
 				}
 
-				if sio.deej.Verbose() {
-					logger.Debugw("Read device command", "cmdID", cmdID, "payloadLen", length)
-				}
+				logger.Debugw("RX cmd", "cmdID", fmt.Sprintf("0x%02x", cmdID), "payloadLen", length, "payload", fmt.Sprintf("%x", payload))
 
 				ch <- inboundMessage{isCmd: true, cmdID: cmdID, payload: payload}
 				continue

@@ -211,6 +211,6 @@ func (sw *SerialWriter) send(cmdID byte, payload []byte) error {
 		return fmt.Errorf("send command 0x%02x: %w", cmdID, err)
 	}
 
-	sw.logger.Debugw("Sent command", "cmdID", fmt.Sprintf("0x%02x", cmdID), "payloadLen", len(payload))
+	sw.logger.Debugw("TX", "cmdID", fmt.Sprintf("0x%02x", cmdID), "payloadLen", len(payload), "payload", fmt.Sprintf("%x", payload))
 	return nil
 }
