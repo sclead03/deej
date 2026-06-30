@@ -280,7 +280,7 @@ Multi-device mute infrastructure is implemented but nonfunctional in practice (s
 **What is implemented:**
 - `windowsMicMuter.applyToDevices()` (`hid_windows.go`) enumerates all active capture devices via a fresh `IMMDeviceEnumerator` each call and calls `SetMute` unconditionally on each matching target — satisfies the "regardless of previous state" requirement.
 - Default `MuteAction`/`UnmuteAction` is `["mute.all"]`/`["unmute.all"]` — sentinels that hit every device.
-- `queryCaptureAllMuted()` (`hid_windows.go` + `session_finder_windows.go`) returns true only if every active device is muted — satisfies the aggregate logic.
+- `queryCaptureAllMuted()` (`hid_windows.go` + `session_finder_windows.go`) returns true only if every active device is muted — satisfies the aggregate logic. Short-circuits on the first unmuted device: once any device is found unmuted, the aggregate is definitively false and remaining devices are not polled. This is intentional — continuing would be redundant.
 - `deviceStateChangedCallback` → `handleDeviceStateChanged()` (`session_finder_windows.go`) fires on device state transitions; rebuilds `captureAevs`, re-registers `micMuteCallback` on all current active devices, pushes updated aggregate to `micMuteChanges`.
 - `HIDManager.currentMuted` cache is updated by `handleExternalMicMuteChange()` so the next button press toggles from the correct state.
 
@@ -326,7 +326,7 @@ Move takeover logic to host (currently firmware-only for per-channel mute) and e
 **Code paths under investigation** (verified line numbers as of 2026-06-28 — check git blame if refactored):
 - `hid_windows.go:318` `applyToDevices()` — creates fresh enumerator, iterates all active capture devices, calls `SetMute`; logs "applyToDevices start/done" with total count
 - `hid_windows.go:432` `IsMuted()` — creates fresh enumerator, delegates to `queryCaptureAllMuted()`; logs "IsMuted aggregate result"
-- `hid_windows.go:235` `queryCaptureAllMuted()` — iterates all active capture devices, returns true only if every one is muted; logs per-device GetMute results
+- `hid_windows.go:235` `queryCaptureAllMuted()` — iterates all active capture devices, returns true only if every one is muted; short-circuits on the first unmuted device (aggregate is already known false, no need to poll further); logs per-device GetMute results only up to the first unmuted device
 - `session_finder_windows.go:752` `registerMicMuteChangeCallback()` — (re)builds `captureAevs` slice under `captureAevsMu`, registers `micMuteCallback` on all active capture devices; logs "Registered mic mute change callbacks on capture devices registered=N total=N"
 - `session_finder_windows.go:911` `deviceStateChangedCallback()` → `session_finder_windows.go:928` `handleDeviceStateChanged()` — hotplug handler; fully rebuilds `captureAevs` under `captureAevsMu`, re-registers callbacks, pushes updated aggregate; logs "Device state changed, pushing updated aggregate allMuted=..."
 - `session_finder_windows.go:872` `micMuteNotifyCallback()` → `session_finder_windows.go:883` `handleMicMuteNotification()` — fires on any registered device's mute change; re-queries full aggregate via `allCaptureDevicesMuted()`; logs "Mic mute notify callback fired" and "Mic mute aggregate computed"
