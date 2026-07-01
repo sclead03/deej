@@ -45,7 +45,7 @@ slider_mapping:
   2: spotify.exe
   3: deej.unmapped
   4: deej.steam
-  5: system
+  5: zoom.exe
 
 # display names for SERENITY OLEDs; 0 = master encoder label, 1-5 = fader OLEDs (match slider_mapping keys)
 # Accented characters supported: é, É, ü, Ü, ö, Ö, ä, Ä, ñ, Ñ
@@ -57,7 +57,7 @@ channel_names:
   2: Spotify
   3: Unmapped
   4: Steam
-  5: System
+  5: Zoom
 
 # RGB button (mic mute button) action
 # actions: mic_mute_toggle (default), mute_mic, unmute_mic, masterVol_mute
